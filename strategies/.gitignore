@@ -1,6 +1,10 @@
 # Strategy configuration file (contains user-specific data)
 strategy_configs.json
 
+# Per-strategy runtime state written while a strategy runs
+# (open position, stop level, trades taken today)
+state/
+
 # Environment variables (contains sensitive data)
 strategy_env.json
 .secure_env
