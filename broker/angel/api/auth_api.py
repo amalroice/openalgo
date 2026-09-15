@@ -40,10 +40,14 @@ def authenticate_broker(clientcode, broker_pin, totp_code):
         data = response.text
         data_dict = json.loads(data)
 
-        if "data" in data_dict and "jwtToken" in data_dict["data"]:
+        # Angel returns {"data": null, "message": "<reason>"} on a rejected login,
+        # so the key is present while the value is None. Testing membership on
+        # that None raised a TypeError that masked Angel's actual message.
+        payload_data = data_dict.get("data")
+        if isinstance(payload_data, dict) and "jwtToken" in payload_data:
             # Return both JWT token and feed token if available (None if not)
-            auth_token = data_dict["data"]["jwtToken"]
-            feed_token = data_dict["data"].get("feedToken", None)
+            auth_token = payload_data["jwtToken"]
+            feed_token = payload_data.get("feedToken", None)
             return auth_token, feed_token, None
         else:
             return None, None, data_dict.get("message", "Authentication failed. Please try again.")
