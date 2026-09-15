@@ -12,6 +12,9 @@ with that script and changes nothing in it. The differences:
       the same relative distance from candle 1.
     - No India VIX filter, and entries run 11:00 to 14:30 rather than 10:30 to
       14:30. Both come from BANKNIFTY backtests; see the notes at the settings.
+    - A stretch rule: while India VIX is 14 or below, a signal is skipped when its
+      entry sits more than 0.4% of price off the day's low (buy) or high (sell) so
+      far.
     - Synthetic volume comes from the six largest NIFTY Bank constituents only.
 
 Every stop, target and trail is measured in INDEX points, never in premium.
@@ -29,6 +32,10 @@ Entry (long; short is the mirror):
     +541.5 and halved the drawdown.
     4. No India VIX filter in this copy (the NIFTY version requires VIX above
        12). VIX_MIN and VIX_MAX are still honoured and are both off.
+    5. Stretch rule (this copy only): while India VIX is inside the STRETCH_VIX_LOW /
+       STRETCH_VIX_HIGH band (now 14 and below), a buy's entry must be within
+       STRETCH_MAX_PCT of the day's low so far, and a sell's within it of the day's
+       high so far.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -117,6 +124,22 @@ DIRECTIONS = ("long", "short")      # sides to trade
 VIX_MIN = None
 VIX_MAX = None
 
+# Stretch rule. While India VIX is above STRETCH_VIX_LOW and up to STRETCH_VIX_HIGH
+# (None removes that bound), skip a buy whose entry is more than STRETCH_MAX_PCT of
+# the entry price above the day's low so far (a sell: below the day's high so far).
+# An unreadable VIX applies the check. Backtest, six-bank volume, entries
+# 11:00-14:30, 4-point cost, 2018-01..2026-09, net index points per lot:
+#   no rule                          +8,620  max drawdown -4,930
+#   0.4% at VIX above 12, up to 14  +11,194  max drawdown -3,984
+#   0.4% at VIX 14 and below        +11,860  max drawdown -3,662  (this setting)
+# The 14-and-below band was picked after seeing those results, and its extra gain
+# comes almost entirely from 2021-2026, when VIX was often under 12. 0.3% on the
+# same band did worse than no rule, so do not tighten the limit without re-testing.
+# Set STRETCH_MAX_PCT to None to disable the rule.
+STRETCH_VIX_LOW = None
+STRETCH_VIX_HIGH = 14.0
+STRETCH_MAX_PCT = 0.004             # 0.4% of the entry price
+
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 25.0                  # NIFTY's 10.0 scaled by the 2.42 level ratio
 LINE_PROXIMITY = 60.0               # NIFTY's 25.0 scaled by the 2.42 level ratio
@@ -130,6 +153,7 @@ SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(11, 0)   # BANKNIFTY paper test; see the note above
 NO_NEW_ENTRY_AFTER = dtime(14, 30)  # too close to square-off to be worth it
 SQUARE_OFF = dtime(15, 0)
+ABANDON_AFTER = dtime(15, 20)       # the exchange refuses MIS orders past 15:15
 
 BAR_SECONDS = 300
 BAR_DELAY = 10                      # wait this long after a bar closes
@@ -673,6 +697,50 @@ def initial_stop(sig: dict) -> float:
     return level
 
 
+def entry_stretch(sig: dict, frame: pd.DataFrame) -> float:
+    """How far the entry sits off the day's extreme so far, as a share of its price.
+
+    Returns:
+        (entry - day low) / entry for a long, (day high - entry) / entry for a
+        short, over today's completed candles up to and including candle 2.
+    """
+    spot = float(frame["close"].iloc[-1])
+    if sig["direction"] == "long":
+        return (spot - float(frame["low"].min())) / spot
+    return (float(frame["high"].max()) - spot) / spot
+
+
+def stretch_allowed(stretch: float, vix: float | None) -> bool:
+    """Apply the stretch rule for the current India VIX.
+
+    Returns:
+        True when the rule is off, VIX is outside the rule's band, or the entry
+        is within STRETCH_MAX_PCT. An unreadable VIX (None) gets the check.
+    """
+    if STRETCH_MAX_PCT is None:
+        return True
+    if vix is not None:
+        above_low = STRETCH_VIX_LOW is None or vix > STRETCH_VIX_LOW
+        below_high = STRETCH_VIX_HIGH is None or vix <= STRETCH_VIX_HIGH
+        if not (above_low and below_high):
+            return True
+    return stretch <= STRETCH_MAX_PCT
+
+
+def stretch_band() -> str:
+    """Describe the VIX band the stretch rule applies in, for log lines.
+
+    Returns:
+        Text such as "VIX 14.0 or below".
+    """
+    parts = []
+    if STRETCH_VIX_LOW is not None:
+        parts.append(f"above {STRETCH_VIX_LOW}")
+    if STRETCH_VIX_HIGH is not None:
+        parts.append(f"{STRETCH_VIX_HIGH} or below")
+    return "VIX " + " and ".join(parts) if parts else "every VIX level"
+
+
 # =============================================================================
 # ORDERS
 # =============================================================================
@@ -693,20 +761,48 @@ def resolve_atm(client, expiry: str, option_type: str) -> dict | None:
 
 
 def nearest_expiry(client) -> str | None:
-    """Return the nearest option expiry in compact form.
+    """Return the nearest option expiry AFTER today, in compact form.
 
     BANKNIFTY has listed monthly expiries only since November 2024, so this is
-    the current month contract.
+    normally the current month contract, and the next month on expiry day.
+
+    Today's own expiry is skipped deliberately. Every stop, target and trail
+    here is measured in INDEX points, but an expiry-day ATM option held to the
+    15:00 square-off decays to almost nothing whatever the index does, so a
+    0-DTE contract cannot express the move the backtest measured.
+
+    The list is parsed and sorted rather than trusted in order, so an unsorted
+    or stale response cannot hand back a contract that has already expired.
 
     Returns:
-        Expiry such as ``29SEP26``, or None when the lookup fails.
+        Expiry such as ``29SEP26``, or None when the lookup fails or nothing
+        listed expires after today.
     """
     e = client.expiry(symbol=UNDERLYING, exchange=FO_EXCHANGE,
                       instrumenttype="options")
     if not ok(e) or not e.get("data"):
         log(f"expiry lookup failed: {e}")
         return None
-    return normalize_expiry(e["data"][0])
+    today = datetime.now(IST).date()
+    dated = []
+    for dashed in e["data"]:
+        try:
+            dated.append((datetime.strptime(dashed, "%d-%b-%y").date(), dashed))
+        except (TypeError, ValueError):
+            log(f"ignoring unparseable expiry {dashed!r}")
+    if not dated:
+        log(f"no expiry could be parsed from {e['data']}")
+        return None
+    dated.sort()
+    stale = [dashed for day, dashed in dated if day <= today]
+    for day, dashed in dated:
+        if day > today:
+            if stale:
+                log(f"skipping expiry {', '.join(stale)} (today or past); "
+                    f"using {dashed}")
+            return normalize_expiry(dashed)
+    log(f"nothing expires after {today}; furthest listed is {dated[-1][1]}")
+    return None
 
 
 def send(client, symbol: str, action: str, quantity: int) -> bool:
@@ -727,6 +823,65 @@ def send(client, symbol: str, action: str, quantity: int) -> bool:
         return False
     log(f"order OK {action} {quantity} {symbol} -> {r.get('orderid')}")
     return True
+
+
+def net_quantity(client, symbol: str) -> int | None:
+    """Net open quantity the broker reports for one option leg.
+
+    Returns:
+        The quantity, 0 when the book carries no open lot, or None when the
+        book cannot be read at all.
+    """
+    try:
+        r = client.positionbook()
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"positionbook raised {exc!r}")
+        return None
+    if not ok(r):
+        log(f"positionbook failed: {r}")
+        return None
+    for row in r.get("data") or []:
+        if row.get("symbol") == symbol and row.get("exchange") == FO_EXCHANGE:
+            try:
+                return int(float(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                log(f"unreadable quantity on {symbol}: {row.get('quantity')!r}")
+                return None
+    return 0
+
+
+def abandon_if_flat(client, state: dict) -> bool:
+    """Drop the tracked position when the broker says it is already closed.
+
+    An exit order is rejected for two very different reasons. Either the order
+    itself failed and retrying next bar is right, or the position is simply no
+    longer there - squared off by the sandbox or the broker on their own
+    schedule, which also refuse fresh MIS orders after 15:15 IST. Retrying that
+    second case never succeeds, and on 2026-09-15 it left the strategy posting
+    the same rejected SELL every five minutes for ninety minutes after the
+    position had in fact been closed at 15:39.
+
+    The position book is the tiebreaker: it is what the broker actually holds,
+    where the state file is only what this process last believed.
+
+    Returns:
+        True when the position was cleared, False when the broker still
+        reports an open lot or the book could not be read.
+    """
+    position = state.get("position")
+    if not position:
+        return True
+    qty = net_quantity(client, position["symbol"])
+    if qty is None:
+        return False
+    if qty == 0:
+        log(f"broker reports no open {position['symbol']}; it was closed "
+            f"elsewhere, so the local position is stale - clearing it")
+        state["position"] = None
+        return True
+    log(f"broker still reports {qty} open {position['symbol']}; keeping the "
+        f"position and retrying the exit next bar")
+    return False
 
 
 # =============================================================================
@@ -795,6 +950,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
         if send(client, position["symbol"], "SELL", qty):
             log(f"STOP hit at {stop:.2f} on the index; closed {qty}")
             state["position"] = None
+        else:
+            abandon_if_flat(client, state)
         return state
 
     # +BOOK_AT_R: book one lot and move the survivor to breakeven.
@@ -805,6 +962,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             position["stop"] = entry
             log(f"+{BOOK_AT_R}R reached (mfe {position['mfe']:.2f} pts); booked "
                 f"1 lot, stop to breakeven {entry:.2f}")
+        elif abandon_if_flat(client, state):
+            return state
         if position["lots_open"] <= 0:
             state["position"] = None
             return state
@@ -821,6 +980,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
                 log(f"close {close:.2f} back through the line {line:.2f}; "
                     f"closed the runner ({qty})")
                 state["position"] = None
+            else:
+                abandon_if_flat(client, state)
             return state
 
     state["position"] = position
@@ -840,6 +1001,8 @@ def square_off(client, state: dict) -> dict:
     if send(client, position["symbol"], "SELL", qty):
         log(f"square-off: closed {qty} {position['symbol']}")
         state["position"] = None
+    else:
+        abandon_if_flat(client, state)
     return state
 
 
@@ -902,6 +1065,20 @@ def cycle(client, state: dict) -> dict:
                 f"above VIX_MAX {VIX_MAX}")
             return state
         log(f"India VIX {vix:.2f} is inside the gate (min {VIX_MIN}, max {VIX_MAX})")
+
+    if STRETCH_MAX_PCT is not None:
+        stretch = entry_stretch(sig, frame)
+        if stretch > STRETCH_MAX_PCT:
+            # Only a stretched entry depends on the VIX band, so the quote is read here.
+            stretch_vix = read_vix(client)
+            if not stretch_allowed(stretch, stretch_vix):
+                regime = "unreadable" if stretch_vix is None else f"{stretch_vix:.2f}"
+                side = "low" if sig["direction"] == "long" else "high"
+                log(f"{sig['direction']} signal skipped: entry is {stretch:.2%} off the day's "
+                    f"{side} with India VIX {regime}, over the {STRETCH_MAX_PCT:.1%} limit")
+                return state
+            log(f"entry is {stretch:.2%} off the day's extreme, but India VIX {stretch_vix:.2f} "
+                f"is outside the rule's band ({stretch_band()}); allowed")
 
     stop = initial_stop(sig)
     spot = float(frame["close"].iloc[-1])
@@ -987,6 +1164,18 @@ def main() -> int:
                 continue
             if now.time() >= SQUARE_OFF and not state.get("position"):
                 log("past square-off with nothing open; done for the day")
+                return 0
+            if now.time() >= ABANDON_AFTER and state.get("position"):
+                # Past this point the exchange refuses MIS orders outright, so
+                # another exit attempt cannot succeed however many bars it is
+                # given. Reconcile once, then stop either way rather than
+                # looping until the host happens to kill the process.
+                if not abandon_if_flat(client, state):
+                    log(f"still tracking {state['position']['symbol']} past "
+                        f"{ABANDON_AFTER:%H:%M} with exits refused; stopping. "
+                        f"CHECK THE BROKER POSITION BY HAND")
+                    state["position"] = None
+                save_state(state)
                 return 0
             if not assert_paper_mode(client):
                 time.sleep(60)

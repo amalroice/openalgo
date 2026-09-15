@@ -128,6 +128,7 @@ SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(10, 30)  # the first hour backtests strongly negative
 NO_NEW_ENTRY_AFTER = dtime(14, 30)  # too close to square-off to be worth it
 SQUARE_OFF = dtime(15, 0)
+ABANDON_AFTER = dtime(15, 20)       # the exchange refuses MIS orders past 15:15
 
 BAR_SECONDS = 300
 BAR_DELAY = 10                      # wait this long after a bar closes
@@ -700,17 +701,46 @@ def resolve_atm(client, expiry: str, option_type: str) -> dict | None:
 
 
 def nearest_weekly(client) -> str | None:
-    """Return the nearest weekly option expiry in compact form.
+    """Return the nearest option expiry AFTER today, in compact form.
+
+    Today's own expiry is skipped deliberately. Every stop, target and trail
+    here is measured in INDEX points, but an expiry-day ATM option held to the
+    15:00 square-off decays to almost nothing whatever the index does, so a
+    0-DTE contract cannot express the move the backtest measured. On NIFTY that
+    costs one week of extra time value roughly one day in five.
+
+    The list is parsed and sorted rather than trusted in order, so an unsorted
+    or stale response cannot hand back a contract that has already expired.
 
     Returns:
-        Expiry such as ``08SEP26``, or None when the lookup fails.
+        Expiry such as ``22SEP26``, or None when the lookup fails or nothing
+        listed expires after today.
     """
     e = client.expiry(symbol=UNDERLYING, exchange=FO_EXCHANGE,
                       instrumenttype="options")
     if not ok(e) or not e.get("data"):
         log(f"expiry lookup failed: {e}")
         return None
-    return normalize_expiry(e["data"][0])
+    today = datetime.now(IST).date()
+    dated = []
+    for dashed in e["data"]:
+        try:
+            dated.append((datetime.strptime(dashed, "%d-%b-%y").date(), dashed))
+        except (TypeError, ValueError):
+            log(f"ignoring unparseable expiry {dashed!r}")
+    if not dated:
+        log(f"no expiry could be parsed from {e['data']}")
+        return None
+    dated.sort()
+    stale = [dashed for day, dashed in dated if day <= today]
+    for day, dashed in dated:
+        if day > today:
+            if stale:
+                log(f"skipping expiry {', '.join(stale)} (today or past); "
+                    f"using {dashed}")
+            return normalize_expiry(dashed)
+    log(f"nothing expires after {today}; furthest listed is {dated[-1][1]}")
+    return None
 
 
 def send(client, symbol: str, action: str, quantity: int) -> bool:
@@ -731,6 +761,65 @@ def send(client, symbol: str, action: str, quantity: int) -> bool:
         return False
     log(f"order OK {action} {quantity} {symbol} -> {r.get('orderid')}")
     return True
+
+
+def net_quantity(client, symbol: str) -> int | None:
+    """Net open quantity the broker reports for one option leg.
+
+    Returns:
+        The quantity, 0 when the book carries no open lot, or None when the
+        book cannot be read at all.
+    """
+    try:
+        r = client.positionbook()
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"positionbook raised {exc!r}")
+        return None
+    if not ok(r):
+        log(f"positionbook failed: {r}")
+        return None
+    for row in r.get("data") or []:
+        if row.get("symbol") == symbol and row.get("exchange") == FO_EXCHANGE:
+            try:
+                return int(float(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                log(f"unreadable quantity on {symbol}: {row.get('quantity')!r}")
+                return None
+    return 0
+
+
+def abandon_if_flat(client, state: dict) -> bool:
+    """Drop the tracked position when the broker says it is already closed.
+
+    An exit order is rejected for two very different reasons. Either the order
+    itself failed and retrying next bar is right, or the position is simply no
+    longer there - squared off by the sandbox or the broker on their own
+    schedule, which also refuse fresh MIS orders after 15:15 IST. Retrying that
+    second case never succeeds, and on 2026-09-15 it left the strategy posting
+    the same rejected SELL every five minutes for ninety minutes after the
+    position had in fact been closed at 15:39.
+
+    The position book is the tiebreaker: it is what the broker actually holds,
+    where the state file is only what this process last believed.
+
+    Returns:
+        True when the position was cleared, False when the broker still
+        reports an open lot or the book could not be read.
+    """
+    position = state.get("position")
+    if not position:
+        return True
+    qty = net_quantity(client, position["symbol"])
+    if qty is None:
+        return False
+    if qty == 0:
+        log(f"broker reports no open {position['symbol']}; it was closed "
+            f"elsewhere, so the local position is stale - clearing it")
+        state["position"] = None
+        return True
+    log(f"broker still reports {qty} open {position['symbol']}; keeping the "
+        f"position and retrying the exit next bar")
+    return False
 
 
 # =============================================================================
@@ -799,6 +888,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
         if send(client, position["symbol"], "SELL", qty):
             log(f"STOP hit at {stop:.2f} on the index; closed {qty}")
             state["position"] = None
+        else:
+            abandon_if_flat(client, state)
         return state
 
     # +BOOK_AT_R: book one lot and move the survivor to breakeven.
@@ -809,6 +900,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             position["stop"] = entry
             log(f"+{BOOK_AT_R}R reached (mfe {position['mfe']:.2f} pts); booked "
                 f"1 lot, stop to breakeven {entry:.2f}")
+        elif abandon_if_flat(client, state):
+            return state
         if position["lots_open"] <= 0:
             state["position"] = None
             return state
@@ -825,6 +918,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
                 log(f"close {close:.2f} back through the line {line:.2f}; "
                     f"closed the runner ({qty})")
                 state["position"] = None
+            else:
+                abandon_if_flat(client, state)
             return state
 
     state["position"] = position
@@ -844,6 +939,8 @@ def square_off(client, state: dict) -> dict:
     if send(client, position["symbol"], "SELL", qty):
         log(f"square-off: closed {qty} {position['symbol']}")
         state["position"] = None
+    else:
+        abandon_if_flat(client, state)
     return state
 
 
@@ -987,6 +1084,18 @@ def main() -> int:
                 continue
             if now.time() >= SQUARE_OFF and not state.get("position"):
                 log("past square-off with nothing open; done for the day")
+                return 0
+            if now.time() >= ABANDON_AFTER and state.get("position"):
+                # Past this point the exchange refuses MIS orders outright, so
+                # another exit attempt cannot succeed however many bars it is
+                # given. Reconcile once, then stop either way rather than
+                # looping until the host happens to kill the process.
+                if not abandon_if_flat(client, state):
+                    log(f"still tracking {state['position']['symbol']} past "
+                        f"{ABANDON_AFTER:%H:%M} with exits refused; stopping. "
+                        f"CHECK THE BROKER POSITION BY HAND")
+                    state["position"] = None
+                save_state(state)
                 return 0
             if not assert_paper_mode(client):
                 time.sleep(60)
