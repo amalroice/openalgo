@@ -113,11 +113,19 @@ def init_scheduler():
 
         # Add daily trading day check job - runs at 00:01 IST every day
         # This stops scheduled strategies on weekends/holidays
+        #
+        # `misfire_grace_time=None` so an overnight suspend cannot swallow it:
+        # 00:01 is exactly when a laptop is most likely to be asleep. Running
+        # late is harmless because the check reads today's market status when
+        # it runs rather than when it was scheduled, and only stops strategies
+        # whose exchange is closed. `market_hours_enforcer` would catch the
+        # same case within a minute; this keeps the two consistent.
         SCHEDULER.add_job(
             func=daily_trading_day_check,
             trigger=CronTrigger(hour=0, minute=1, timezone=IST),
             id="daily_trading_day_check",
             replace_existing=True,
+            misfire_grace_time=None,
         )
         logger.debug("Daily trading day check scheduled at 00:01 IST")
 
@@ -1503,6 +1511,11 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
         SCHEDULER.remove_job(stop_job_id)
 
     # Schedule start with holiday check wrapper (time is already in IST from frontend)
+    #
+    # The start job keeps APScheduler's default one-second misfire grace on
+    # purpose. `scheduled_start_strategy` validates the day and the exchange
+    # but NOT the time of day, so a job recovered hours late would launch a
+    # 09:00 strategy well outside its window. Not starting is the safe miss.
     hour, minute = map(int, start_time.split(":"))
     SCHEDULER.add_job(
         func=lambda: scheduled_start_strategy(strategy_id),
@@ -1512,6 +1525,15 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
     )
 
     # Schedule stop if provided (always runs for safety)
+    #
+    # `misfire_grace_time=None` means "run however late". The stop job is the
+    # mirror image of the start job: running it late is always better than not
+    # running it, and `scheduled_stop_strategy` is unconditional and idempotent.
+    # Without this, APScheduler's one-second default silently drops the stop
+    # whenever the host is suspended across it - a laptop sleeping on low
+    # battery, a VM paused, a machine hibernating over a holiday. On 2026-09-15
+    # a critical-battery sleep from 14:50 to 15:38 swallowed two 15:15 stops,
+    # while the 16:00 stop that fell after the resume fired normally.
     if stop_time:
         hour, minute = map(int, stop_time.split(":"))
         SCHEDULER.add_job(
@@ -1519,6 +1541,7 @@ def schedule_strategy(strategy_id, start_time, stop_time=None, days=None):
             trigger=CronTrigger(hour=hour, minute=minute, day_of_week=",".join(days), timezone=IST),
             id=stop_job_id,
             replace_existing=True,
+            misfire_grace_time=None,
         )
 
     # Update config
