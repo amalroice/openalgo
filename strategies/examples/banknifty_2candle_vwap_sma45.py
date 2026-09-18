@@ -51,7 +51,7 @@ Stop:
     STOP_BUFFER performs similarly on NIFTY; 10.0 is not a fitted optimum, and
     the 25.0 used here is that value scaled to the BANKNIFTY level.
 
-Management (2 lots):
+Management (2 lots, at most MAX_TRADES_PER_DAY entries a session):
     BOOK_AT_R  sell 1 lot, move the stop on the remaining lot to breakeven
     beyond     the remaining lot trails the nearer line, and is closed when a
                candle CLOSES back below it (above it, for a short)
@@ -115,7 +115,15 @@ LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
 LOTS = 2                            # 1 lot is booked at +BOOK_AT_R, 1 lot trails
 BOOK_AT_R = 1.5                     # R multiple that books a lot and arms the trail
-MAX_TRADES_PER_DAY = 2
+# Raised from 2 on 2026-09-16. The third trade of the day is systematically better
+# than the average one: with the window left at 11:00, going 2 -> 3 adds 77 trades
+# over 2018-2026 for +1,621 points (+13%) and 38 trades over 2018-01..2021-09 for
+# +1,054 (+31%), and it is the rare change that improves the OUT-OF-SAMPLE window -
+# PF 1.10 -> 1.12 and max drawdown -3,662 -> -3,301 there. Better in all four
+# windows tested. A 4th slot is noise: it adds 7 trades in 2,133 sessions and is
+# slightly worse in three of the four. Note this does nothing for days that take no
+# trade at all - it only frees a slot on days that already traded twice.
+MAX_TRADES_PER_DAY = 3
 DIRECTIONS = ("long", "short")      # sides to trade
 
 # Regime filter: off in this copy. On BANKNIFTY (six-bank volume) no VIX band beat
