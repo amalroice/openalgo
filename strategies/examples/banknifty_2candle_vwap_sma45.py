@@ -52,9 +52,9 @@ Stop:
     the 25.0 used here is that value scaled to the BANKNIFTY level.
 
 Management (2 lots, at most MAX_TRADES_PER_DAY entries a session):
-    BOOK_AT_R  sell 1 lot, move the stop on the remaining lot to breakeven
-    beyond     the remaining lot trails the nearer line, and is closed when a
-               candle CLOSES back below it (above it, for a short)
+    trail      both lots stay in. The stop sits TRAIL_DIST_PCT of the entry
+               behind the best price, moved in TRAIL_STEP_PCT steps, and never
+               below the candle stop. No partial booking, no line exit.
     15:00      everything is squared off
 
 Index spot publishes no volume, so the VWAP is weighted by synthetic volume:
@@ -113,8 +113,24 @@ INTERVAL = "5m"
 SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
-LOTS = 2                            # 1 lot is booked at +BOOK_AT_R, 1 lot trails
-BOOK_AT_R = 1.5                     # R multiple that books a lot and arms the trail
+LOTS = 2                            # both lots trail together
+
+# Percent trailing stop, replacing 1-lot booking at +1.5R and the line trail on
+# 2026-09-18. Replayed 2018-01-01..2026-09-16 on this script's own entries, net
+# of 4 pts a trade, closes filled at the bar close:
+#
+#                        last 2y   last 5y   2018-01..2021-09     full    maxDD
+#     book 1.5R + line    +6,371    +9,386        +4,400        +13,786   -3,301
+#     trail 0.5% / 0.1%   +8,905   +11,591        +4,707        +16,298   -4,140
+#
+# Better in all four windows and in 6 of 9 years (worse in 2020-2022), at the
+# cost of a deeper drawdown and a 44% -> 36% win rate. The step matters: with
+# the line exit kept, 0.5%/0.2% was worse than the old rule in 2018-2021 and
+# 0.4%/0.2% no better overall.
+# Figures are index points - the trail holds longer, and option decay over that
+# extra time is not in them.
+TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
+TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
 # Raised from 2 on 2026-09-16. The third trade of the day is systematically better
 # than the average one: with the window left at 11:00, going 2 -> 3 adds 77 trades
 # over 2018-2026 for +1,621 points (+13%) and 38 trades over 2018-01..2021-09 for
@@ -688,6 +704,23 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
     return None
 
 
+def trail_level(entry: float, mfe: float, long: bool) -> float | None:
+    """Trailing-stop level for a trade whose best excursion is mfe points.
+
+    The stop sits TRAIL_DIST_PCT of the entry price behind the best price, and
+    that best price is counted only in whole TRAIL_STEP_PCT steps, so the stop
+    moves in jumps rather than tick by tick.
+
+    Returns:
+        The trailing level, or None before the first full step.
+    """
+    steps = int(mfe // (TRAIL_STEP_PCT * entry))
+    if steps < 1:
+        return None
+    offset = steps * TRAIL_STEP_PCT * entry - TRAIL_DIST_PCT * entry
+    return entry + offset if long else entry - offset
+
+
 def initial_stop(sig: dict) -> float:
     """Candle 1's extreme, or the nearby line when it sits close to it.
 
@@ -943,10 +976,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
 
     bar = frame.iloc[-1]
     long = position["direction"] == "long"
-    close = float(bar["close"])
     stop = float(position["stop"])
     entry = float(position["entry"])
-    risk = float(position["risk"])
     lot = int(position["lotsize"])
 
     excursion = (float(bar["high"]) - entry) if long else (entry - float(bar["low"]))
@@ -962,35 +993,14 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             abandon_if_flat(client, state)
         return state
 
-    # +BOOK_AT_R: book one lot and move the survivor to breakeven.
-    if not position["booked"] and position["mfe"] >= BOOK_AT_R * risk:
-        if send(client, position["symbol"], "SELL", lot):
-            position["lots_open"] -= 1
-            position["booked"] = True
-            position["stop"] = entry
-            log(f"+{BOOK_AT_R}R reached (mfe {position['mfe']:.2f} pts); booked "
-                f"1 lot, stop to breakeven {entry:.2f}")
-        elif abandon_if_flat(client, state):
-            return state
-        if position["lots_open"] <= 0:
-            state["position"] = None
-            return state
-
-    # The runner trails the nearer line and dies on a close back through it.
-    if position["booked"]:
-        line = float(bar["upper"]) if long else float(bar["lower"])
-        position["stop"] = max(position["stop"], line) if long else min(
-            position["stop"], line)
-        lost = close < line if long else close > line
-        if lost:
-            qty = lot * position["lots_open"]
-            if send(client, position["symbol"], "SELL", qty):
-                log(f"close {close:.2f} back through the line {line:.2f}; "
-                    f"closed the runner ({qty})")
-                state["position"] = None
-            else:
-                abandon_if_flat(client, state)
-            return state
+    # Ratchet the stop behind the best price. It only ever moves in the trade's
+    # favour, and is checked against the NEXT bar, as the backtest does.
+    level = trail_level(entry, position["mfe"], long)
+    if level is not None:
+        moved = max(stop, level) if long else min(stop, level)
+        if moved != stop:
+            position["stop"] = moved
+            log(f"trail: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
 
     state["position"] = position
     return state
@@ -1113,7 +1123,7 @@ def cycle(client, state: dict) -> dict:
         "direction": sig["direction"], "symbol": leg["symbol"],
         "lotsize": leg["lotsize"], "lots_open": LOTS,
         "entry": spot, "stop": stop, "risk": risk,
-        "mfe": 0.0, "booked": False, "opened": now.isoformat(),
+        "mfe": 0.0, "opened": now.isoformat(),
     }
     return state
 
@@ -1155,8 +1165,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     client = build_client()
-    log(f"{STRATEGY_TAG} starting: {LOTS} lots, 1 booked at +{BOOK_AT_R}R, runner trails "
-        f"the lines, square-off {SQUARE_OFF:%H:%M}")
+    log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
+        f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)

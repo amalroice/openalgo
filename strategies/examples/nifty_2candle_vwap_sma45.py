@@ -48,11 +48,9 @@ Stop:
     back toward the 51.8% this buffer was introduced to escape. Do not retry it.
 
 Management (2 lots):
-    BOOK_AT_R  sell 1 lot, move the stop on the remaining lot to breakeven.
-               A trade whose stop is wider than WIDE_STOP_PTS books at
-               WIDE_STOP_BOOK_AT_R instead, which is earlier.
-    beyond     the remaining lot trails the nearer line, and is closed when a
-               candle CLOSES back below it (above it, for a short)
+    trail      both lots stay in. The stop sits TRAIL_DIST_PCT of the entry
+               behind the best price, moved in TRAIL_STEP_PCT steps, and never
+               below the candle stop. No partial booking, no line exit.
     15:00      everything is squared off
 
 NIFTY spot publishes no volume, so the VWAP is weighted by synthetic volume:
@@ -110,36 +108,25 @@ INTERVAL = "5m"
 SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
-LOTS = 2                            # 1 lot is booked at +BOOK_AT_R, 1 lot trails
-BOOK_AT_R = 1.5                     # R multiple that books a lot and arms the trail
+LOTS = 2                            # both lots trail together
 
-# A trade whose stop is wider than WIDE_STOP_PTS books its first lot at
-# WIDE_STOP_BOOK_AT_R instead. Over 2016-10-06 to 2026-09-17, 808 of 2,139
-# trades (37.8%) carried a stop over 30 points; 13.4% of them reached 1R but
-# never 1.5R, so under the plain rule they booked nothing and rode the full
-# stop back down.
+# Percent trailing stop, replacing 1-lot booking at +1.5R (+1R when the stop was
+# over 30 pts) and the line trail on 2026-09-18. With nothing booked, the
+# wide-stop 1R rule and its shadow comparison went too. Replayed
+# 2016-10-03..2026-09-10 on this script's own entries, net of 3 pts a trade,
+# closes filled at the bar close:
 #
-# Note the threshold is in POINTS, not a percentage, so what it catches drifts
-# with the index: 10.7% of trades in 2016, 42.0% in 2020, 69.2% so far in 2026.
-# At the current level it is close to "every trade", which is a different
-# strategy from what the 2016-2019 rows describe.
+#                        last 2y   last 5y   2018-01..2021-09     full
+#     book + line trail   +1,450      +582        -2,164         -1,774
+#     trail 0.5% / 0.2%   +3,327    +2,725        -1,650           +860
 #
-# Measured over the same window against plain 1.5R booking, this rule COSTS
-# money and is kept on purpose for the steadier curve, not for return:
-#
-#     total     14,076 -> 10,544 index points   (-25%)
-#     average    6.58  ->  4.89 pts per trade
-#     win rate   42.5% -> 44.3%
-#     PF         1.22  ->  1.17
-#     max DD    -2,513 -> -2,324               (-7.5%, the one gain)
-#
-# Negative in 9 of the 11 years. 2025 (+685) is the only clear gain; 2026 is
-# the worst at -1,818, and 2026 is also the year the rule fires most often.
-# The mechanism: of wide-stop trades, 30.9% run past 1.5R while only 13.4%
-# stall between 1R and 1.5R, so booking at 1R rescues the few and clips the
-# many that actually pay.
-WIDE_STOP_PTS = 30.0
-WIDE_STOP_BOOK_AT_R = 1.0
+# Nearby settings (0.4-0.6% distance, 0.1-0.2% step) land close together, so
+# this is not a knife-edge fit. 2018-2021 loses under every stop rule tested.
+# If stops filled AT the stop price instead of the bar close, the old rule
+# would lead; this script exits at the close, so the close figures apply.
+# Figures are index points; option decay over the longer holds is not in them.
+TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
+TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
@@ -186,11 +173,6 @@ HISTORY_PACE = 0.55                 # seconds between history calls
 IST = ZoneInfo("Asia/Kolkata")
 STATE_DIR = Path("strategies") / "state"
 STATE_FILE = STATE_DIR / "nifty_2candle_vwap_sma45.json"
-
-# Append-only record of the shadow booking comparison, one row per trade the
-# wide-stop rule actually changed. Months of these are the out-of-sample
-# evidence the backtest cannot supply.
-SHADOW_FILE = Path("log") / "strategies" / "shadow_book_at_r.csv"
 
 # NIFTY 50 constituents, verified against the Angel symbol master on 2026-09-07.
 # TMPV is Tata Motors after the passenger-vehicle demerger and rename; the old
@@ -715,14 +697,21 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
     return None
 
 
-def book_at_r(risk: float) -> float:
-    """R multiple that books the first lot, given this trade's stop distance.
+def trail_level(entry: float, mfe: float, long: bool) -> float | None:
+    """Trailing-stop level for a trade whose best excursion is mfe points.
+
+    The stop sits TRAIL_DIST_PCT of the entry price behind the best price, and
+    that best price is counted only in whole TRAIL_STEP_PCT steps, so the stop
+    moves in jumps rather than tick by tick.
 
     Returns:
-        WIDE_STOP_BOOK_AT_R when the stop is wider than WIDE_STOP_PTS, else
-        BOOK_AT_R.
+        The trailing level, or None before the first full step.
     """
-    return WIDE_STOP_BOOK_AT_R if risk > WIDE_STOP_PTS else BOOK_AT_R
+    steps = int(mfe // (TRAIL_STEP_PCT * entry))
+    if steps < 1:
+        return None
+    offset = steps * TRAIL_STEP_PCT * entry - TRAIL_DIST_PCT * entry
+    return entry + offset if long else entry - offset
 
 
 def initial_stop(sig: dict) -> float:
@@ -919,149 +908,6 @@ def fresh_day(state: dict, today: str) -> dict:
 
 
 # =============================================================================
-# SHADOW BOOKING TEST
-# =============================================================================
-#
-# WIDE_STOP_BOOK_AT_R only changes trades whose stop is wider than
-# WIDE_STOP_PTS. For exactly those, this replays the SAME trade a second time
-# booking at the plain BOOK_AT_R and logs the two side by side.
-#
-# Both legs are simulated in index points off the same bars, so the comparison
-# is like for like - no real premium fill is mixed into it. Nothing in this
-# section places, cancels, amends or reads an order, and nothing it does can
-# affect the live position.
-
-
-def _leg(target_r: float, stop: float) -> dict:
-    """A fresh simulated leg of LOTS lots that books at target_r.
-
-    Returns:
-        Leg dict.
-    """
-    return {"book_at_r": target_r, "stop": stop, "lots_open": LOTS,
-            "booked": False, "mfe": 0.0, "lot1": None, "done": False,
-            "pts": None, "reason": None}
-
-
-def _close_leg(leg: dict, exit_price: float, reason: str, entry: float,
-               long: bool) -> None:
-    """Settle a leg and record its points per lot."""
-    runner = (exit_price - entry) if long else (entry - exit_price)
-    lot1 = leg["lot1"] if leg["lot1"] is not None else runner
-    leg["pts"] = (lot1 + runner) / LOTS
-    leg["reason"] = reason
-    leg["done"] = True
-
-
-def _advance(leg: dict, shadow: dict, bar) -> None:
-    """Step one simulated leg over one bar, mirroring manage() exactly."""
-    if leg["done"]:
-        return
-    long = shadow["direction"] == "long"
-    entry, risk = float(shadow["entry"]), float(shadow["risk"])
-    close = float(bar["close"])
-
-    excursion = (float(bar["high"]) - entry) if long else (entry - float(bar["low"]))
-    leg["mfe"] = max(leg["mfe"], excursion)
-
-    breached = (float(bar["low"]) <= leg["stop"]) if long else (
-        float(bar["high"]) >= leg["stop"])
-    if breached:
-        _close_leg(leg, leg["stop"], "trail_stop" if leg["booked"] else "stop",
-                   entry, long)
-        return
-
-    if not leg["booked"] and leg["mfe"] >= leg["book_at_r"] * risk:
-        leg["booked"] = True
-        leg["lots_open"] -= 1
-        leg["lot1"] = (close - entry) if long else (entry - close)
-        leg["stop"] = entry
-
-    if leg["booked"]:
-        line = float(bar["upper"]) if long else float(bar["lower"])
-        leg["stop"] = max(leg["stop"], line) if long else min(leg["stop"], line)
-        if (close < line) if long else (close > line):
-            _close_leg(leg, close, "line_close", entry, long)
-
-
-def _shadow_record(shadow: dict, diff: float) -> None:
-    """Append one finished comparison so months of them can be totalled."""
-    live, test = shadow["live"], shadow["test"]
-    header = ("opened,direction,entry,risk_pts,live_book_at_r,live_pts,"
-              "live_reason,test_book_at_r,test_pts,test_reason,diff_pts\n")
-    row = (f"{shadow['opened']},{shadow['direction']},{shadow['entry']:.2f},"
-           f"{shadow['risk']:.2f},{live['book_at_r']},{live['pts']:.2f},"
-           f"{live['reason']},{test['book_at_r']},{test['pts']:.2f},"
-           f"{test['reason']},{diff:+.2f}\n")
-    try:
-        SHADOW_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fresh = not SHADOW_FILE.exists()
-        with SHADOW_FILE.open("a", encoding="utf-8") as handle:
-            if fresh:
-                handle.write(header)
-            handle.write(row)
-    except OSError as exc:
-        log(f"could not append the shadow record ({exc}); the log line stands")
-
-
-def _shadow_report(state: dict) -> None:
-    """Log the comparison once both legs have finished, then clear it."""
-    shadow = state.get("shadow")
-    if not shadow:
-        return
-    live, test = shadow["live"], shadow["test"]
-    if not (live["done"] and test["done"]):
-        return
-    diff = live["pts"] - test["pts"]
-    verdict = "better" if diff > 0 else ("worse" if diff < 0 else "level")
-    log(f"shadow: live +{live['book_at_r']}R booking made {live['pts']:+.2f} "
-        f"pts/lot ({live['reason']}); plain +{test['book_at_r']}R would have "
-        f"made {test['pts']:+.2f} ({test['reason']}); the rule was {verdict} "
-        f"by {abs(diff):.2f}")
-    _shadow_record(shadow, diff)
-    state["shadow"] = None
-
-
-def shadow_open(state: dict, direction: str, entry: float, stop: float,
-                risk: float, target_r: float) -> None:
-    """Start a comparison, but only for a trade the wide-stop rule changes."""
-    shadow_finish(state)
-    if target_r == BOOK_AT_R:
-        state["shadow"] = None
-        return
-    state["shadow"] = {
-        "direction": direction, "entry": entry, "risk": risk,
-        "opened": datetime.now(IST).isoformat(), "last_close": entry,
-        "live": _leg(target_r, stop), "test": _leg(BOOK_AT_R, stop),
-    }
-
-
-def shadow_step(state: dict, frame: pd.DataFrame) -> None:
-    """Advance both legs one bar. Runs on after the live position has closed."""
-    shadow = state.get("shadow")
-    if not shadow:
-        return
-    bar = frame.iloc[-1]
-    shadow["last_close"] = float(bar["close"])
-    _advance(shadow["live"], shadow, bar)
-    _advance(shadow["test"], shadow, bar)
-    _shadow_report(state)
-
-
-def shadow_finish(state: dict) -> None:
-    """Settle whatever is still open at the square-off."""
-    shadow = state.get("shadow")
-    if not shadow:
-        return
-    long = shadow["direction"] == "long"
-    for leg in (shadow["live"], shadow["test"]):
-        if not leg["done"]:
-            _close_leg(leg, float(shadow["last_close"]), "square_off",
-                       float(shadow["entry"]), long)
-    _shadow_report(state)
-
-
-# =============================================================================
 # MANAGEMENT
 # =============================================================================
 
@@ -1077,10 +923,8 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
 
     bar = frame.iloc[-1]
     long = position["direction"] == "long"
-    close = float(bar["close"])
     stop = float(position["stop"])
     entry = float(position["entry"])
-    risk = float(position["risk"])
     lot = int(position["lotsize"])
 
     excursion = (float(bar["high"]) - entry) if long else (entry - float(bar["low"]))
@@ -1096,37 +940,14 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             abandon_if_flat(client, state)
         return state
 
-    # Book one lot and move the survivor to breakeven. A position resumed from
-    # a state file written before WIDE_STOP_PTS existed carries no book_at_r.
-    target_r = float(position.get("book_at_r", BOOK_AT_R))
-    if not position["booked"] and position["mfe"] >= target_r * risk:
-        if send(client, position["symbol"], "SELL", lot):
-            position["lots_open"] -= 1
-            position["booked"] = True
-            position["stop"] = entry
-            log(f"+{target_r}R reached (mfe {position['mfe']:.2f} pts); booked "
-                f"1 lot, stop to breakeven {entry:.2f}")
-        elif abandon_if_flat(client, state):
-            return state
-        if position["lots_open"] <= 0:
-            state["position"] = None
-            return state
-
-    # The runner trails the nearer line and dies on a close back through it.
-    if position["booked"]:
-        line = float(bar["upper"]) if long else float(bar["lower"])
-        position["stop"] = max(position["stop"], line) if long else min(
-            position["stop"], line)
-        lost = close < line if long else close > line
-        if lost:
-            qty = lot * position["lots_open"]
-            if send(client, position["symbol"], "SELL", qty):
-                log(f"close {close:.2f} back through the line {line:.2f}; "
-                    f"closed the runner ({qty})")
-                state["position"] = None
-            else:
-                abandon_if_flat(client, state)
-            return state
+    # Ratchet the stop behind the best price. It only ever moves in the trade's
+    # favour, and is checked against the NEXT bar, as the backtest does.
+    level = trail_level(entry, position["mfe"], long)
+    if level is not None:
+        moved = max(stop, level) if long else min(stop, level)
+        if moved != stop:
+            position["stop"] = moved
+            log(f"trail: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
 
     state["position"] = position
     return state
@@ -1138,10 +959,6 @@ def square_off(client, state: dict) -> dict:
     Returns:
         The updated state dict.
     """
-    # The comparison is settled first: it is bookkeeping, and it must not be
-    # skipped by the early return when there is nothing to flatten.
-    shadow_finish(state)
-
     position = state.get("position")
     if not position:
         return state
@@ -1181,9 +998,6 @@ def cycle(client, state: dict) -> dict:
     log(f"bar {last:%H:%M} close {float(frame['close'].iloc[-1]):.2f} "
         f"vwap {float(frame['vwap'].iloc[-1]):.2f} "
         f"sma {float(frame['sma'].iloc[-1]):.2f}")
-
-    # Independent of the live position, which may already have closed.
-    shadow_step(state, frame)
 
     state = manage(client, state, frame)
 
@@ -1227,10 +1041,9 @@ def cycle(client, state: dict) -> dict:
     if not leg:
         return state
 
-    target_r = book_at_r(risk)
     quantity = leg["lotsize"] * LOTS
     log(f"{sig['direction'].upper()} signal: index {spot:.2f}, stop {stop:.2f} "
-        f"(risk {risk:.2f} pts, booking at +{target_r}R), buying {quantity} "
+        f"(risk {risk:.2f} pts), buying {quantity} "
         f"{leg['symbol']}")
     if not send(client, leg["symbol"], "BUY", quantity):
         return state
@@ -1239,10 +1052,9 @@ def cycle(client, state: dict) -> dict:
     state["position"] = {
         "direction": sig["direction"], "symbol": leg["symbol"],
         "lotsize": leg["lotsize"], "lots_open": LOTS,
-        "entry": spot, "stop": stop, "risk": risk, "book_at_r": target_r,
-        "mfe": 0.0, "booked": False, "opened": now.isoformat(),
+        "entry": spot, "stop": stop, "risk": risk,
+        "mfe": 0.0, "opened": now.isoformat(),
     }
-    shadow_open(state, sig["direction"], spot, stop, risk, target_r)
     return state
 
 
@@ -1283,10 +1095,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     client = build_client()
-    log(f"{STRATEGY_TAG} starting: {LOTS} lots, 1 booked at +{BOOK_AT_R}R "
-        f"(+{WIDE_STOP_BOOK_AT_R}R when the stop is over {WIDE_STOP_PTS:.0f} "
-        f"points), runner trails "
-        f"the lines, square-off {SQUARE_OFF:%H:%M}")
+    log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
+        f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)
