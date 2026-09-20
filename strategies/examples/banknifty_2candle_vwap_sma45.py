@@ -133,6 +133,23 @@ LOTS = 1                            # cut from 2 on 2026-09-20 for the first liv
 # extra time is not in them.
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
+
+# TESTED AND REJECTED, 2026-09-20: protecting profit earlier. Median favourable
+# move here is 80.7 pts and the stop first lifts above entry around 270:
+#
+#                           last 2y  last 5y  2018-01..2021-09   full   maxDD
+#     none (this setting)    +5,594   +5,591       +4,032      +9,907  -2,366
+#     breakeven at +30 pts   +4,775   +6,579       +1,800      +8,695  -1,505
+#     breakeven at +70 pts   +4,395   +4,640       +4,855      +9,730  -1,865
+#     breakeven at +100 pts  +4,545   +4,508       +4,013      +8,804  -1,895
+#
+# Closer here than on NIFTY, where every variant simply lost: +30 buys 36% less
+# drawdown for 12% less profit, better risk-adjusted at 5.78 against 4.19
+# return over max drawdown. Rejected because it more than halves the
+# out-of-sample window, +4,032 -> +1,800, which is the window worth trusting.
+# Note 30 pts is proportionally far tighter here than on NIFTY.
+# Reproduce: backtests/banknifty_percent_trail_replay.py, replay(lock_pts=30).
+
 # Raised from 2 on 2026-09-16. The third trade of the day is systematically better
 # than the average one: with the window left at 11:00, going 2 -> 3 adds 77 trades
 # over 2018-2026 for +1,621 points (+13%) and 38 trades over 2018-01..2021-09 for

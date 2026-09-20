@@ -152,6 +152,28 @@ LOTS = 1                            # cut from 2 on 2026-09-20 for the first liv
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
 
+# TESTED AND REJECTED, 2026-09-20: protecting profit earlier. The complaint is
+# real - this trail is inert on most trades. Median favourable move is 24.4 pts
+# against the ~91 pts (0.6% of entry) where the stop first lifts above entry, so
+# it engages on 13.2% of trades. Locking breakeven once a trade runs a fixed
+# distance looks like the fix and is not:
+#
+#                           last 2y  last 5y  2018-01..2021-09   full   maxDD
+#     none (this setting)    +3,003   +2,744        +228       +2,996  -1,697
+#     breakeven at +20 pts   +1,051      +67        +340         +519  -1,742
+#     breakeven at +30 pts   +1,503     +730        +264       +1,195  -2,047
+#     breakeven at +50 pts   +2,418   +1,767        +145       +1,981  -1,864
+#     +30 then trail 30 pts    +880     -452        -858       -1,194  -3,006
+#
+# Every variant loses and tighter is worse; the fixed 30-pt trail turns the
+# strategy negative while posting the HIGHEST win rate of the set at 43.6%.
+# That is the signature of cutting a fat tail. Winners' median favourable move
+# is 61.9 pts and losers' is 11.4, so a lock between the two scratches winners
+# without saving losers. This is the same lesson as the STOP_BUFFER note in the
+# docstring, on its third appearance. If the late engagement bothers you the
+# lever is TRAIL_DIST_PCT, not earlier protection.
+# Reproduce: backtests/nifty_percent_trail_replay.py, replay(lock_pts=30).
+
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
 

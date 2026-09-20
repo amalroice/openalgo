@@ -147,7 +147,9 @@ def initial_stop(direction: str, c1_low: float, c1_high: float,
 def replay(frame: pd.DataFrame, vix: pd.Series, dist: float, step: float,
            vix_min: float | None = VIX_MIN,
            directions: tuple[str, ...] = ("long", "short"),
-           breakout: str = "close") -> pd.DataFrame:
+           breakout: str = "close",
+           lock_pts: float | None = None,
+           lock_trail: float | None = None) -> pd.DataFrame:
     """One pass over the frame.
 
     Returns:
@@ -194,6 +196,19 @@ def replay(frame: pd.DataFrame, vix: pd.Series, dist: float, step: float,
                 if level is not None:
                     pos["stop"] = (max(pos["stop"], level) if pos["long"]
                                    else min(pos["stop"], level))
+                # Early protection: once the trade has run lock_pts in favour,
+                # the stop is never worse than breakeven, and with lock_trail
+                # it follows that far behind the best price instead.
+                if lock_pts is not None and pos["mfe"] >= lock_pts:
+                    if lock_trail is None:
+                        floor = pos["entry"]
+                    else:
+                        best = (pos["entry"] + pos["mfe"] if pos["long"]
+                                else pos["entry"] - pos["mfe"])
+                        floor = (best - lock_trail if pos["long"]
+                                 else best + lock_trail)
+                    pos["stop"] = (max(pos["stop"], floor) if pos["long"]
+                                   else min(pos["stop"], floor))
                 continue
 
         if pos is not None or n_today >= MAX_TRADES_PER_DAY:
@@ -246,6 +261,7 @@ def replay(frame: pd.DataFrame, vix: pd.Series, dist: float, step: float,
             "direction": "long" if trade["long"] else "short",
             "entry": trade["entry"], "exit": exit_price, "risk": trade["risk"],
             "gross": points, "net": points - COST_PTS, "reason": trade["reason"],
+            "mfe": trade["mfe"],
         })
     return pd.DataFrame(rows)
 
