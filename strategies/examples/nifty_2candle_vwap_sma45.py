@@ -9,7 +9,9 @@ Entry (long; short is the mirror):
        each candle's low is above the higher of the two lines.
     2. The pair is the first of its run: the candle before candle 1 was not
        itself completely above both lines.
-    3. Candle 2 closes above candle 1's close.
+    3. Candle 2 closes above candle 1's HIGH (a short mirrors it: candle 2
+       closes below candle 1's LOW). Clearing candle 1's whole range, not just
+       its close, is what makes this a breakout.
     Entry is a market order as soon as candle 2 closes, and never before
     NO_NEW_ENTRY_BEFORE. Over 2026-01-01 to 2026-09-09 the average trade by
     entry hour climbed monotonically from -7.58 index points at 09h to +9.89
@@ -94,7 +96,7 @@ from openalgo import api
 # CONFIGURATION  (per-strategy env vars do not exist in the host - edit here)
 # =============================================================================
 
-I_UNDERSTAND_THIS_IS_LIVE = False   # must be True to run outside analyzer mode
+I_UNDERSTAND_THIS_IS_LIVE = True    # must be True to run outside analyzer mode
 DRY_RUN = False                     # resolve and log, place nothing
 
 STRATEGY_TAG = "NIFTY_2CANDLE_VWAP_SMA45"
@@ -152,6 +154,26 @@ TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
+
+# Resting stop parked at the broker on entry, so a dead machine or a dropped
+# link cannot leave the option unprotected. The in-process trail above is still
+# what normally exits; this only catches the session nobody is watching.
+#
+# The index stop is converted to a premium with delta AND gamma. Checked against
+# a full Black-76 revaluation, delta alone is off by 3.20 points at a 60-point
+# adverse move and 12.54 at 120; adding the gamma term cuts that to 0.03 and
+# 0.40. Delta alone is not good enough.
+#
+# The level is then pushed DOWN, because premium falls for reasons the index
+# has not moved: theta to square-off is worth about 4.3 points on a 2-day ATM
+# option, and 2 points of IV is worth about 13.7 - against a total stop
+# distance of roughly 26. An unwidened mirror of the index stop would be fired
+# by ordinary IV noise on trades that were never in trouble. Widening is what
+# makes this a disaster stop rather than a second, worse trail.
+BROKER_STOP = True                  # False reverts to the in-process stop alone
+BROKER_STOP_IV_POINTS = 2.0         # IV points of vega headroom
+BROKER_STOP_LIMIT_SLIP = 0.05       # limit sits this far below the trigger
+TICK = 0.05                         # NFO option tick
 
 # Regime filter: take no signal at or below this India VIX. Set to None to disable.
 #
@@ -705,9 +727,23 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
         # already have been clear of both lines.
         if bool(before[flag]) and frame.index[-3].date() == today:
             continue
-        if direction == "long" and second["close"] <= first["close"]:
+        # Candle 2 must close clear of candle 1's RANGE, not merely its close:
+        # above the high to buy a CE, below the low to buy a PE. Until
+        # 2026-09-20 this compared closes, which is a much weaker breakout and
+        # was not the intended rule. Replayed 2016-10..2026-09 on this script's
+        # own frame, net of 3 pts a trade:
+        #
+        #                       last 2y  last 5y  2018-01..2021-09   full   maxDD
+        #     close beyond close  +3,049   +2,959       -1,594      +1,087  -3,788
+        #     close beyond range  +3,003   +2,744         +228      +2,996  -1,697
+        #
+        # 2,096 trades become 1,476, the average trade +0.52 -> +2.03 and the
+        # win rate 33.7% -> 36.6%. The last two years give up 46 points; in
+        # exchange 2018-2021 stops losing for the first time under any rule
+        # tested here, and the full-window drawdown more than halves.
+        if direction == "long" and second["close"] <= first["high"]:
             continue
-        if direction == "short" and second["close"] >= first["close"]:
+        if direction == "short" and second["close"] >= first["low"]:
             continue
         return {
             "direction": direction,
@@ -887,11 +923,235 @@ def abandon_if_flat(client, state: dict) -> bool:
     if qty == 0:
         log(f"broker reports no open {position['symbol']}; it was closed "
             f"elsewhere, so the local position is stale - clearing it")
+        # The lot is gone but the resting stop is not: left alone it becomes a
+        # live SELL with nothing behind it, and if the premium later touches
+        # the trigger it opens a NAKED SHORT. Pull it before dropping the
+        # position, not after.
+        drop_resting_stop(client, position, "the position was closed elsewhere")
         state["position"] = None
         return True
     log(f"broker still reports {qty} open {position['symbol']}; keeping the "
         f"position and retrying the exit next bar")
     return False
+
+
+# =============================================================================
+# BROKER-SIDE STOP
+# =============================================================================
+
+def round_tick(value: float) -> float:
+    """Round down to the exchange tick, so the level never drifts tighter.
+
+    Rounded to paise as well: ``int(41.70 / 0.05) * 0.05`` lands on
+    41.650000000000006, and a price carrying that much float residue is a
+    field the broker can reject outright.
+    """
+    return round(max(TICK, int(round(value / TICK, 6)) * TICK), 2)
+
+
+def option_stop_price(client, symbol: str, index_entry: float,
+                      index_stop: float) -> float | None:
+    """Premium level matching the index stop, widened into a disaster stop.
+
+    See the BROKER_STOP notes in CONFIGURATION for why delta alone is not
+    enough and why the level is deliberately pushed below the mirror. The
+    premium comes from the same Greeks call as the sensitivities, so the two
+    always describe one snapshot of one option.
+
+    Returns:
+        Trigger price rounded to the tick, or None when it cannot be trusted -
+        in which case no resting stop is placed and the caller says so loudly.
+    """
+    try:
+        r = client.optiongreeks(symbol=symbol, exchange=FO_EXCHANGE)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"greeks raised {exc!r}; no broker stop for {symbol}")
+        return None
+    if not ok(r):
+        log(f"greeks failed for {symbol}: {r}")
+        return None
+
+    body = r.get("data") if isinstance(r.get("data"), dict) else r
+    greeks = body.get("greeks") or {}
+    try:
+        delta = float(greeks["delta"])
+        gamma = float(greeks["gamma"])
+        theta = float(greeks["theta"])
+        vega = float(greeks["vega"])
+        entry_premium = float(body["option_price"])
+    except (KeyError, TypeError, ValueError):
+        log(f"greeks unreadable for {symbol}: {body!r}")
+        return None
+    if delta == 0.0:
+        log(f"zero delta for {symbol}; refusing to size a stop off it")
+        return None
+    if entry_premium <= 0:
+        log(f"non-positive premium {entry_premium} for {symbol}")
+        return None
+
+    move = index_stop - index_entry
+    mirror = entry_premium + delta * move + 0.5 * gamma * move**2
+
+    now = datetime.now(IST)
+    close = now.replace(hour=SQUARE_OFF.hour, minute=SQUARE_OFF.minute,
+                        second=0, microsecond=0)
+    hours = max((close - now).total_seconds() / 3600.0, 0.0)
+    theta_buffer = abs(theta) * hours / 24.0
+    vega_buffer = abs(vega) * BROKER_STOP_IV_POINTS
+
+    level = mirror - theta_buffer - vega_buffer
+    if level <= 0 or level >= entry_premium:
+        log(f"stop level {level:.2f} is not below the {entry_premium:.2f} entry "
+            f"premium; no broker stop for {symbol}")
+        return None
+
+    trigger = round_tick(level)
+    log(f"broker stop for {symbol}: index {index_entry:.2f} -> {index_stop:.2f} "
+        f"({move:+.2f}) maps to {mirror:.2f} on delta {delta:+.4f} gamma "
+        f"{gamma:.6f}; less {theta_buffer:.2f} theta over {hours:.1f}h and "
+        f"{vega_buffer:.2f} for {BROKER_STOP_IV_POINTS:.0f} IV points "
+        f"-> trigger {trigger:.2f}")
+    return trigger
+
+
+def place_broker_stop(client, symbol: str, quantity: int,
+                      trigger: float) -> str | None:
+    """Park a stop-limit SELL at the broker.
+
+    A limit rather than SL-M: NSE restricts market-type stops in F&O, and a
+    rejected SL-M would leave the position silently unprotected. The limit sits
+    BROKER_STOP_LIMIT_SLIP below the trigger so it still fills when the move is
+    quick - a stop that cannot fill protects nothing.
+
+    Returns:
+        The broker order id, or None when the order was not accepted.
+    """
+    limit = round_tick(trigger * (1.0 - BROKER_STOP_LIMIT_SLIP))
+    try:
+        r = client.placeorder(
+            strategy=STRATEGY_TAG, symbol=symbol, action="SELL",
+            exchange=FO_EXCHANGE, price_type="SL", product=PRODUCT,
+            quantity=quantity, price=limit, trigger_price=trigger,
+        )
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"broker stop raised {exc!r} for {symbol}")
+        return None
+    if not ok(r):
+        log(f"broker stop REJECTED for {symbol} at trigger {trigger:.2f} "
+            f"limit {limit:.2f}: {r}")
+        return None
+    order_id = r.get("orderid")
+    log(f"broker stop resting: {quantity} {symbol} trigger {trigger:.2f} "
+        f"limit {limit:.2f} -> {order_id}")
+    return order_id
+
+
+def stop_order_state(client, order_id: str) -> str:
+    """Classify a resting stop: 'open', 'filled', 'gone' or 'unknown'."""
+    try:
+        r = client.orderstatus(order_id=order_id, strategy=STRATEGY_TAG)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"orderstatus raised {exc!r} for {order_id}")
+        return "unknown"
+    if not ok(r):
+        log(f"orderstatus failed for {order_id}: {r}")
+        return "unknown"
+    data = r.get("data") or r
+    raw = str(data.get("order_status") or data.get("status") or "").lower()
+    if "complete" in raw or "filled" in raw or "executed" in raw:
+        return "filled"
+    if "cancel" in raw or "reject" in raw:
+        return "gone"
+    if raw:
+        return "open"
+    return "unknown"
+
+
+def drop_resting_stop(client, position: dict, why: str) -> None:
+    """Cancel a resting stop whose position is already gone.
+
+    Unlike ``release_broker_stop`` this cannot decline to act: the caller has
+    already established there is no lot left to protect, so the only question
+    is whether the cancel lands. A stop that outlives its position is a live
+    SELL with nothing behind it, which is why a failure here is shouted rather
+    than swallowed - it needs a human at the broker terminal.
+    """
+    order_id = position.pop("stop_order_id", None)
+    if not order_id:
+        return
+    try:
+        if ok(client.cancelorder(order_id=order_id, strategy=STRATEGY_TAG)):
+            log(f"cancelled resting stop {order_id}: {why}")
+            return
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"cancel of orphaned stop {order_id} raised {exc!r}")
+    status = stop_order_state(client, order_id)
+    if status in ("filled", "gone"):
+        log(f"orphaned stop {order_id} is already {status}; nothing rests")
+        return
+    log(f"COULD NOT CANCEL resting stop {order_id} ({why}). It may still be "
+        f"live with no position behind it, and filling it would open a naked "
+        f"short. CANCEL IT BY HAND AT THE BROKER")
+
+
+def release_broker_stop(client, state: dict) -> str:
+    """Clear the resting stop before this process sends its own exit.
+
+    This is the guard against the one failure that matters: the resting stop
+    filling at the same time as a market exit, which does not flatten the
+    position but sells it twice and leaves a NAKED SHORT option. The exit is
+    only allowed once the stop is known to be gone.
+
+    Returns:
+        'clear'   - nothing is resting; the caller may send its exit.
+        'filled'  - the stop already did the job; the position has been cleared.
+        'blocked' - the stop may still fill; the caller must NOT send an exit.
+    """
+    position = state.get("position") or {}
+    order_id = position.get("stop_order_id")
+    if not order_id:
+        return "clear"
+
+    try:
+        r = client.cancelorder(order_id=order_id, strategy=STRATEGY_TAG)
+        cancelled = ok(r)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"cancel of stop {order_id} raised {exc!r}")
+        cancelled = False
+
+    if cancelled:
+        log(f"cancelled resting stop {order_id}")
+        position.pop("stop_order_id", None)
+        return "clear"
+
+    # A cancel fails both when the order is already gone and when the broker
+    # simply could not be reached; those need opposite responses, so ask.
+    status = stop_order_state(client, order_id)
+    if status == "filled":
+        log(f"resting stop {order_id} had already filled; the position is "
+            f"closed at the broker, clearing it locally")
+        state["position"] = None
+        return "filled"
+    if status == "gone":
+        position.pop("stop_order_id", None)
+        return "clear"
+    log(f"cannot confirm resting stop {order_id} is gone (status {status}); "
+        f"holding off the exit this bar rather than risking a double sell")
+    return "blocked"
+
+
+def stop_fired(client, state: dict) -> bool:
+    """True when the resting stop closed the position while we were away."""
+    position = state.get("position") or {}
+    order_id = position.get("stop_order_id")
+    if not order_id:
+        return False
+    if stop_order_state(client, order_id) != "filled":
+        return False
+    log(f"resting stop {order_id} filled on {position.get('symbol')}; the "
+        f"broker closed this position, clearing local state")
+    state["position"] = None
+    return True
 
 
 # =============================================================================
@@ -943,6 +1203,11 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
     if not position:
         return state
 
+    # The resting stop may have closed this position between bars - or while
+    # this process was not running at all, which is the whole point of it.
+    if BROKER_STOP and stop_fired(client, state):
+        return state
+
     bar = frame.iloc[-1]
     long = position["direction"] == "long"
     stop = float(position["stop"])
@@ -954,6 +1219,14 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
 
     breached = (float(bar["low"]) <= stop) if long else (float(bar["high"]) >= stop)
     if breached:
+        outcome = release_broker_stop(client, state) if BROKER_STOP else "clear"
+        if outcome == "filled":
+            return state
+        if outcome == "blocked":
+            # Selling now could double up on a stop that is still live, so the
+            # index stop simply waits a bar. It is already breached; another
+            # five minutes of exposure beats an accidental naked short.
+            return state
         qty = lot * position["lots_open"]
         if send(client, position["symbol"], "SELL", qty):
             log(f"STOP hit at {stop:.2f} on the index; closed {qty}")
@@ -984,6 +1257,14 @@ def square_off(client, state: dict) -> dict:
     position = state.get("position")
     if not position:
         return state
+    if BROKER_STOP:
+        outcome = release_broker_stop(client, state)
+        if outcome == "filled":
+            return state
+        if outcome == "blocked":
+            log("square-off deferred: the resting stop could not be confirmed "
+                "gone. CHECK THE BROKER POSITION BY HAND")
+            return state
     qty = int(position["lotsize"]) * int(position["lots_open"])
     if send(client, position["symbol"], "SELL", qty):
         log(f"square-off: closed {qty} {position['symbol']}")
@@ -1077,6 +1358,21 @@ def cycle(client, state: dict) -> dict:
         "entry": spot, "stop": stop, "risk": risk,
         "mfe": 0.0, "opened": now.isoformat(),
     }
+
+    # Park the disaster stop now, while the position is fresh and the Greeks
+    # describe the option we actually hold. A failure here is logged loudly but
+    # does not unwind the trade: the in-process stop still runs, and exiting a
+    # good entry because a Greeks call timed out would be the worse trade.
+    if BROKER_STOP:
+        trigger = option_stop_price(client, leg["symbol"], spot, stop)
+        order_id = (place_broker_stop(client, leg["symbol"], quantity, trigger)
+                    if trigger is not None else None)
+        if order_id:
+            state["position"]["stop_order_id"] = order_id
+            state["position"]["stop_trigger"] = trigger
+        else:
+            log("NO BROKER STOP on this position. It is protected only while "
+                "this process is alive.")
     return state
 
 
@@ -1144,6 +1440,15 @@ def main() -> int:
                     log(f"still tracking {state['position']['symbol']} past "
                         f"{ABANDON_AFTER:%H:%M} with exits refused; stopping. "
                         f"CHECK THE BROKER POSITION BY HAND")
+                    # This process is about to exit while a lot is still open.
+                    # The broker squares MIS off on its own shortly, and once
+                    # it does, a stop still resting would be a naked short
+                    # waiting on the 15:20-15:30 tail. Take it down now: the
+                    # auto square-off is better protection than an order
+                    # nobody is left to reconcile.
+                    drop_resting_stop(client, state["position"],
+                                      "abandoning the position past "
+                                      f"{ABANDON_AFTER:%H:%M}")
                     state["position"] = None
                 save_state(state)
                 return 0
