@@ -113,7 +113,7 @@ INTERVAL = "5m"
 SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
-LOTS = 2                            # both lots trail together
+LOTS = 1                            # cut from 2 on 2026-09-20 for the first live week
 
 # Percent trailing stop, replacing 1-lot booking at +1.5R and the line trail on
 # 2026-09-18. Replayed 2018-01-01..2026-09-16 on this script's own entries, net
