@@ -112,16 +112,17 @@ def trail_level(entry, mfe, long, dist, step):
     return entry + offset if long else entry - offset
 
 
-def initial_stop(direction, c1_low, c1_high, line):
+def initial_stop(direction, c1_low, c1_high, line,
+                 buffer=STOP_BUFFER, proximity=LINE_PROXIMITY):
     """Candle 1's extreme, or the nearby line when it sits close to it."""
     if direction == "long":
-        level = c1_low - STOP_BUFFER
-        if 0 <= level - line <= LINE_PROXIMITY:
-            return line - STOP_BUFFER
+        level = c1_low - buffer
+        if 0 <= level - line <= proximity:
+            return line - buffer
         return level
-    level = c1_high + STOP_BUFFER
-    if 0 <= line - level <= LINE_PROXIMITY:
-        return line + STOP_BUFFER
+    level = c1_high + buffer
+    if 0 <= line - level <= proximity:
+        return line + buffer
     return level
 
 
@@ -138,7 +139,8 @@ def stretch_allowed(stretch: float, vix: float | None) -> bool:
 
 
 def replay(frame, vix, dist=TRAIL_DIST_PCT, step=TRAIL_STEP_PCT,
-           breakout="close", lock_pts=None, lock_trail=None) -> pd.DataFrame:
+           breakout="close", lock_pts=None, lock_trail=None,
+           stop_buffer=STOP_BUFFER, line_proximity=LINE_PROXIMITY) -> pd.DataFrame:
     """One pass. ``breakout``: 'close' beyond candle 1's close, 'extreme' its range."""
     hi, lo, cl = frame["high"].values, frame["low"].values, frame["close"].values
     above, below = frame["above"].values, frame["below"].values
@@ -224,7 +226,8 @@ def replay(frame, vix, dist=TRAIL_DIST_PCT, step=TRAIL_STEP_PCT,
                 break
 
             line = upper[i - 1] if direction == "long" else lower[i - 1]
-            stop = initial_stop(direction, lo[i - 1], hi[i - 1], line)
+            stop = initial_stop(direction, lo[i - 1], hi[i - 1], line,
+                                stop_buffer, line_proximity)
             risk = (entry - stop) if direction == "long" else (stop - entry)
             if risk <= 0:
                 break

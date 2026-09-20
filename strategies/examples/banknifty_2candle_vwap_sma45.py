@@ -207,6 +207,30 @@ MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 25.0                  # NIFTY's 10.0 scaled by the 2.42 level ratio
 LINE_PROXIMITY = 60.0               # NIFTY's 25.0 scaled by the 2.42 level ratio
 
+# TESTED AND REJECTED, 2026-09-20: rescaling these by volatility instead of by
+# index level. The 2.42 above is a PRICE ratio, but BANKNIFTY also ranges 1.49%
+# a day against NIFTY's 1.07% (2,410 sessions, 2016-2026), so in POINTS its
+# average day range is about 3.1x NIFTY's, not 2.42x. That argues for a buffer
+# near 31. Swept with proximity held at this file's 2.4 ratio to the buffer:
+#
+#     buffer  prox  last 2y  last 5y  2018-01..2021-09   full    maxDD  ret/DD
+#         15    36   +5,478   +5,733       +3,271       +9,352  -2,159   4.33
+#         25    60   +5,594   +5,591       +4,032       +9,907  -2,366   4.19
+#         31    74   +5,591   +5,698       +3,626       +9,654  -2,428   3.98
+#         40    96   +4,805   +5,385       +4,864      +10,561  -2,077   5.09
+#         60   144   +4,712   +5,713       +4,930      +10,911  -2,292   4.76
+#
+# 31 is worse than 25 on profit, on drawdown and on return over drawdown, so
+# the volatility argument simply does not hold. Wider still (40-60) does beat
+# 25 on the full window, but every point of that gain comes from 2018-2021
+# while the last two years fall +5,594 -> +4,712 - a regime artifact, not an
+# edge. The surface is noisy enough to swamp the effect in any case: 20 gives
+# +8,777 against 25's +9,907, a 1,130-point swing for five points of buffer.
+# Win rate does climb cleanly with the buffer, 36.2% -> 42.5%. It just does not
+# pay, which is the STOP_BUFFER lesson from the other direction.
+# Reproduce: backtests/banknifty_percent_trail_replay.py,
+# replay(stop_buffer=..., line_proximity=...).
+
 # Entry window 11:00-14:30. On BANKNIFTY with six-bank volume, no VIX filter and a
 # 4-point cost per trade, 2021-09..2026-09 netted +7,258 index points per lot
 # against +3,550 for 10:30-14:30. But 11:00 was picked from that same period:
