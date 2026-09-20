@@ -146,7 +146,8 @@ def initial_stop(direction: str, c1_low: float, c1_high: float,
 
 def replay(frame: pd.DataFrame, vix: pd.Series, dist: float, step: float,
            vix_min: float | None = VIX_MIN,
-           directions: tuple[str, ...] = ("long", "short")) -> pd.DataFrame:
+           directions: tuple[str, ...] = ("long", "short"),
+           breakout: str = "close") -> pd.DataFrame:
     """One pass over the frame.
 
     Returns:
@@ -210,9 +211,13 @@ def replay(frame: pd.DataFrame, vix: pd.Series, dist: float, step: float,
             # The run has to begin at candle 1.
             if days[i - 2] == days[i] and flag[i - 2]:
                 continue
-            if direction == "long" and cl[i] <= cl[i - 1]:
+            # 'close': candle 2 closes beyond candle 1's CLOSE (as shipped).
+            # 'extreme': beyond candle 1's HIGH for a long, LOW for a short.
+            ref_long = cl[i - 1] if breakout == "close" else hi[i - 1]
+            ref_short = cl[i - 1] if breakout == "close" else lo[i - 1]
+            if direction == "long" and cl[i] <= ref_long:
                 continue
-            if direction == "short" and cl[i] >= cl[i - 1]:
+            if direction == "short" and cl[i] >= ref_short:
                 continue
             if vix_min is not None:
                 value = vixv[i]

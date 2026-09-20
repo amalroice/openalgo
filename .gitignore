@@ -104,12 +104,14 @@ workspace/**
 !workspace/**/
 !workspace/readme.md
 !workspace/**/readme.md
-# Narrow exception, 2026-09-20. The harness behind the trail tables in
-# strategies/examples/*2candle* has to ship with them: the original was never
+# Narrow exception, 2026-09-20. The harnesses behind the tables in
+# strategies/examples/*2candle* have to ship with them: the original was never
 # committed, so those numbers could not be reproduced and had to be rebuilt
-# from scratch. A committed result needs its harness in the repo. This is the
-# only non-readme file tracked under workspace/ -- keep it that way.
+# from scratch. A committed result needs its harness in the repo. These are the
+# only non-readme files tracked under workspace/ -- keep it that way, and add a
+# line here whenever a measurement gets quoted into a committed file.
 !workspace/indicators/backtests/nifty_percent_trail_replay.py
+!workspace/indicators/backtests/banknifty_percent_trail_replay.py
 
 # Environment files, everywhere and in every variant. Plain `.env` was
 # already covered, but `.env.production` / `.env.bak` / `env.backup` were
