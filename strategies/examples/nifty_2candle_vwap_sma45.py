@@ -108,7 +108,7 @@ INTERVAL = "5m"
 SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
-LOTS = 2                            # both lots trail together
+LOTS = 1                            # cut from 2 on 2026-09-20 for the first live week
 
 # Percent trailing stop, replacing 1-lot booking at +1.5R (+1R when the stop was
 # over 30 pts) and the line trail on 2026-09-18. With nothing booked, the
@@ -125,6 +125,28 @@ LOTS = 2                            # both lots trail together
 # If stops filled AT the stop price instead of the bar close, the old rule
 # would lead; this script exits at the close, so the close figures apply.
 # Figures are index points; option decay over the longer holds is not in them.
+#
+# BANKNIFTY's 0.1% step was tried here on 2026-09-20 and reverted the same day.
+# It was measured on NIFTY for the first time on a harness rebuilt from this
+# script, since the original was never committed; that rebuild reproduces the
+# 0.2% row above to within 3-26% per window, so read the levels below as
+# approximate but the comparison as sound - same harness, same 2,096 entries.
+# See backtests/nifty_percent_trail_replay.py.
+#
+#                        last 2y   last 5y   2018-01..2021-09     full    maxDD
+#     trail 0.5% / 0.2%   +3,049    +2,959        -1,594         +1,087   -3,788
+#     trail 0.5% / 0.1%   +2,823    +2,784        -1,761           +767   -3,947
+#
+# Worse in all four windows. Year by year it is better in 6 of 11 but loses
+# +1,212 -> +892 overall, the gap coming almost entirely from 2019 (-251) and
+# 2026 (-276), so this is noise rather than an edge either way - across a
+# 0.4-0.6% x 0.1-0.3% sweep the full-window result moves by ~570 points with no
+# monotonic pattern. The point is that there is no evidence FOR 0.1% on NIFTY.
+#
+# That sweep did show the whole 0.6% distance row beating 0.5% at every step and
+# in every window, cutting 2018-2021 from -1,594 to between -310 and -869. A
+# whole-row effect, not one lucky cell - but untested out of sample and not
+# adopted. Do not change the distance on the strength of that sweep alone.
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
 
