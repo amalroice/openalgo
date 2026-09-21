@@ -10,8 +10,8 @@ with that script and changes nothing in it. The differences:
     - STOP_BUFFER and LINE_PROXIMITY are the NIFTY values scaled by the index
       level ratio (56,606.55 / 23,398.10 = 2.42 on 2026-09-11), so the stop sits
       the same relative distance from candle 1.
-    - No India VIX filter, and entries run 11:00 to 14:30 rather than 10:30 to
-      14:30. Both come from BANKNIFTY backtests; see the notes at the settings.
+    - Entries run 11:00 to 14:30 rather than 10:30 to 14:30, from BANKNIFTY
+      backtests; see the note at the setting.
     - A stretch rule: while India VIX is 14 or below, a signal is skipped when its
       entry sits more than 0.4% of price off the day's low (buy) or high (sell) so
       far.
@@ -32,8 +32,8 @@ Entry (long; short is the mirror):
     entry hour climbed monotonically from -7.58 index points at 09h to +9.89
     at 13h; skipping the first hour turned that year from -329.7 points to
     +541.5 and halved the drawdown.
-    4. No India VIX filter in this copy (the NIFTY version requires VIX above
-       12). VIX_MIN and VIX_MAX are still honoured and are both off.
+    4. India VIX at or above VIX_MIN (10, the same as NIFTY since 2026-09-21).
+       VIX_MAX is still honoured and is off.
     5. Stretch rule (this copy only): while India VIX is inside the STRETCH_VIX_LOW /
        STRETCH_VIX_HIGH band (now 14 and below), a buy's entry must be within
        STRETCH_MAX_PCT of the day's low so far, and a sell's within it of the day's
@@ -54,9 +54,15 @@ Stop:
     the 25.0 used here is that value scaled to the BANKNIFTY level.
 
 Management (2 lots, at most MAX_TRADES_PER_DAY entries a session):
-    trail      both lots stay in. The stop sits TRAIL_DIST_PCT of the entry
-               behind the best price, moved in TRAIL_STEP_PCT steps, and never
-               below the candle stop. No partial booking, no line exit.
+    target     OFF (TARGET_R = None). When set, the whole position is sold
+               the moment the index trades TARGET_R times R past the entry, R
+               being the entry less candle 1's low. Backtests badly; see there.
+    close stop OFF (CLOSE_STOP = False). When on, a candle that CLOSES below
+               candle 1's low (short: above its high) exits.
+    trail      the stop sits TRAIL_DIST_PCT of the entry behind the best
+               price, moved in TRAIL_STEP_PCT steps, and never below the
+               candle stop. No partial booking, no line exit.
+    broker     the resting broker stop is a mechanical-failure backstop only.
     15:00      everything is squared off
 
 Index spot publishes no volume, so the VWAP is weighted by synthetic volume:
@@ -134,6 +140,33 @@ LOTS = 1                            # cut from 2 on 2026-09-20 for the first liv
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
 
+# Profit booking and the close stop, added 2026-09-21 on the user's rule and
+# switched off after the backtest below. R is the entry less candle 1's LOW (a short: candle 1's
+# HIGH less the entry) - the raw candle extreme, not the buffered stop. The whole
+# position is sold the moment the index trades TARGET_R of it past the entry;
+# the index is polled every TARGET_POLL_SECONDS between bars so the booking does
+# not wait for a candle to close. Separately, a candle that CLOSES beyond candle
+# 1's extreme exits. That runs beside the touch stop, not instead of it, and the
+# resting broker stop stays underneath both as the mechanical-failure backstop.
+TARGET_R = None                     # 1.5 books the whole position at 1.5R; off, see below
+CLOSE_STOP = False                  # True exits on a close beyond candle 1; off, see below
+TARGET_POLL_SECONDS = 5
+
+# SWITCHED OFF the same evening, 2026-09-21, after a two-year replay
+# (2024-09-11..2026-09-18, net index points per lot, target filled AT its price,
+# which flatters it):
+#
+#                              NIFTY   PF    BANKNIFTY   PF
+#     trail only (VIX 10)     +3,186  1.39     +6,201   1.68
+#     + close stop            +2,478  1.39     +5,727   1.63   (added alone, VIX as before)
+#     + 1.5R target             +649  1.11       +595   1.07   (added alone, VIX as before)
+#     all three                  +27  1.00     +1,401   1.19
+#
+# The target lifts the win rate to ~52% but caps the few long runs to square-off
+# that carry this strategy - the median target is only 39 NIFTY points away.
+# The code stays so either rule can be re-enabled by flipping the switch.
+# Reproduce: workspace/indicators/backtests/twocandle_target_close_stop_replay.py
+
 # TESTED AND REJECTED, 2026-09-20: protecting profit earlier. Median favourable
 # move here is 80.7 pts and the stop first lifts above entry around 270:
 #
@@ -181,10 +214,11 @@ BROKER_STOP_IV_POINTS = 2.0         # IV points of vega headroom
 BROKER_STOP_LIMIT_SLIP = 0.05       # limit sits this far below the trigger
 TICK = 0.05                         # NFO option tick
 
-# Regime filter: off in this copy. On BANKNIFTY (six-bank volume) no VIX band beat
-# taking every signal in total, over 2018-2026 or over the last two years. Set
-# VIX_MIN to take signals only above a level, VIX_MAX only below one.
-VIX_MIN = None
+# Regime filter. On BANKNIFTY (six-bank volume) no VIX band beat taking every
+# signal in total, over 2018-2026 or over the last two years; VIX_MIN = 10 was
+# set on 2026-09-21 by the user's decision to match NIFTY, not from a backtest.
+# Signals trade at VIX_MIN and above, and only below VIX_MAX.
+VIX_MIN = 10.0
 VIX_MAX = None
 
 # Stretch rule. While India VIX is above STRETCH_VIX_LOW and up to STRETCH_VIX_HIGH
@@ -1269,6 +1303,30 @@ def fresh_day(state: dict, today: str) -> dict:
 # MANAGEMENT
 # =============================================================================
 
+def exit_position(client, state: dict, why: str) -> dict:
+    """Clear the resting stop, then sell the whole open position.
+
+    Returns:
+        The updated state dict.
+    """
+    position = state["position"]
+    outcome = release_broker_stop(client, state) if BROKER_STOP else "clear"
+    if outcome == "filled":
+        return state
+    if outcome == "blocked":
+        # Selling now could double up on a stop that is still live, so the
+        # exit simply waits a bar. Another five minutes of exposure beats an
+        # accidental naked short.
+        return state
+    qty = int(position["lotsize"]) * int(position["lots_open"])
+    if send(client, position["symbol"], "SELL", qty):
+        log(f"{why}; closed {qty}")
+        state["position"] = None
+    else:
+        abandon_if_flat(client, state)
+    return state
+
+
 def manage(client, state: dict, frame: pd.DataFrame) -> dict:
     """Advance stops on the open position and close it when a rule fires.
 
@@ -1288,28 +1346,30 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
     long = position["direction"] == "long"
     stop = float(position["stop"])
     entry = float(position["entry"])
-    lot = int(position["lotsize"])
 
     excursion = (float(bar["high"]) - entry) if long else (entry - float(bar["low"]))
     position["mfe"] = max(float(position.get("mfe", 0.0)), excursion)
 
     breached = (float(bar["low"]) <= stop) if long else (float(bar["high"]) >= stop)
     if breached:
-        outcome = release_broker_stop(client, state) if BROKER_STOP else "clear"
-        if outcome == "filled":
-            return state
-        if outcome == "blocked":
-            # Selling now could double up on a stop that is still live, so the
-            # index stop simply waits a bar. It is already breached; another
-            # five minutes of exposure beats an accidental naked short.
-            return state
-        qty = lot * position["lots_open"]
-        if send(client, position["symbol"], "SELL", qty):
-            log(f"STOP hit at {stop:.2f} on the index; closed {qty}")
-            state["position"] = None
-        else:
-            abandon_if_flat(client, state)
-        return state
+        return exit_position(client, state, f"STOP hit at {stop:.2f} on the index")
+
+    # The live watch between bars normally books the target; this catches a bar
+    # that reached it while the watch was not looking (a slow cycle, a restart).
+    target = position.get("target")
+    if target is not None:
+        reached = (float(bar["high"]) >= target) if long else (float(bar["low"]) <= target)
+        if reached:
+            return exit_position(client, state, f"TARGET {TARGET_R}R reached at "
+                                 f"{target:.2f} on the index")
+
+    extreme = position.get("c1_low" if long else "c1_high")
+    if CLOSE_STOP and extreme is not None:
+        close = float(bar["close"])
+        if (close < extreme) if long else (close > extreme):
+            side = "low" if long else "high"
+            return exit_position(client, state, f"CLOSE STOP: candle closed {close:.2f} "
+                                 f"beyond candle 1's {side} {extreme:.2f}")
 
     # Ratchet the stop behind the best price. It only ever moves in the trade's
     # favour, and is checked against the NEXT bar, as the backtest does.
@@ -1400,8 +1460,8 @@ def cycle(client, state: dict) -> dict:
             # so an unreadable VIX skips the signal rather than trading blind.
             log("VIX unreadable; skipping this signal rather than guessing the regime")
             return state
-        if VIX_MIN is not None and vix <= VIX_MIN:
-            log(f"{sig['direction']} signal skipped: India VIX {vix:.2f} is at or "
+        if VIX_MIN is not None and vix < VIX_MIN:
+            log(f"{sig['direction']} signal skipped: India VIX {vix:.2f} is "
                 f"below VIX_MIN {VIX_MIN}")
             return state
         if VIX_MAX is not None and vix >= VIX_MAX:
@@ -1450,7 +1510,15 @@ def cycle(client, state: dict) -> dict:
         "lotsize": leg["lotsize"], "lots_open": LOTS,
         "entry": spot, "stop": stop, "risk": risk,
         "mfe": 0.0, "opened": now.isoformat(),
+        "c1_low": sig["c1_low"], "c1_high": sig["c1_high"], "target": None,
     }
+    if TARGET_R is not None:
+        long = sig["direction"] == "long"
+        r_pts = (spot - sig["c1_low"]) if long else (sig["c1_high"] - spot)
+        target = spot + TARGET_R * r_pts if long else spot - TARGET_R * r_pts
+        state["position"]["target"] = target
+        log(f"target {target:.2f}: {TARGET_R}R of {r_pts:.2f} pts to candle 1's "
+            f"{'low' if long else 'high'}")
 
     # Park the disaster stop now, while the position is fresh and the Greeks
     # describe the option we actually hold. A failure here is logged loudly but
@@ -1486,12 +1554,59 @@ def ensure_feed() -> None:
     log("volume feed still not up; using the history API for this bar")
 
 
-def sleep_to_next_bar() -> None:
-    """Block until shortly after the next 5-minute candle closes."""
+def index_ltp(client) -> float | None:
+    """Last traded index price, or None when the quote cannot be read."""
+    try:
+        q = client.quotes(symbol=UNDERLYING, exchange=INDEX_EXCHANGE)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"index quote raised {exc!r}")
+        return None
+    if not ok(q):
+        log(f"index quote failed: {q}")
+        return None
+    return float((q.get("data") or {}).get("ltp") or 0) or None
+
+
+def watch_target(client, state: dict, deadline: float) -> None:
+    """Poll the index until the deadline and book the target when it trades.
+
+    Runs on the main thread in the gap between bars, so it never races
+    cycle() for the position. Any exit attempt ends the watch; a blocked one
+    is retried by the next bar's manage().
+    """
+    while not _shutdown and time.monotonic() + TARGET_POLL_SECONDS < deadline:
+        position = state.get("position")
+        if not position or position.get("target") is None:
+            return
+        if datetime.now(IST).time() >= SQUARE_OFF:
+            return
+        time.sleep(TARGET_POLL_SECONDS)
+        price = index_ltp(client)
+        if price is None:
+            continue
+        target = float(position["target"])
+        long = position["direction"] == "long"
+        if (price >= target) if long else (price <= target):
+            exit_position(client, state, f"TARGET {TARGET_R}R hit at {price:.2f} on "
+                          f"the index (target {target:.2f})")
+            save_state(state)
+            return
+
+
+def sleep_to_next_bar(client=None, state: dict | None = None) -> None:
+    """Block until shortly after the next 5-minute candle closes.
+
+    With a position open, the wait is spent watching the profit target.
+    """
     now = datetime.now(IST)
     epoch = int(now.timestamp())
     wait = BAR_SECONDS - (epoch % BAR_SECONDS) + BAR_DELAY
-    time.sleep(wait)
+    deadline = time.monotonic() + wait
+    if client is not None and state is not None and state.get("position"):
+        watch_target(client, state, deadline)
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def main() -> int:
@@ -1554,7 +1669,7 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001 - one bad bar must not kill the day
                 log(f"cycle failed: {exc!r}")
             save_state(state)
-            sleep_to_next_bar()
+            sleep_to_next_bar(client, state)
     finally:
         save_state(state)
         if _FEED is not None:

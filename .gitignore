@@ -112,6 +112,7 @@ workspace/**
 # line here whenever a measurement gets quoted into a committed file.
 !workspace/indicators/backtests/nifty_percent_trail_replay.py
 !workspace/indicators/backtests/banknifty_percent_trail_replay.py
+!workspace/indicators/backtests/twocandle_target_close_stop_replay.py
 
 # Environment files, everywhere and in every variant. Plain `.env` was
 # already covered, but `.env.production` / `.env.bak` / `env.backup` were
