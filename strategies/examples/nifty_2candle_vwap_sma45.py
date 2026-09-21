@@ -20,6 +20,9 @@ Entry (long; short is the mirror):
     4. India VIX at or above VIX_MIN (10 since 2026-09-21; it was above 12,
        which stood the strategy down through September 2026 - see the table
        at VIX_MIN for why 12 was chosen).
+    5. SMA(45) on candle 2 has moved in the trade's direction over the last
+       SLOPE_BARS candles: higher than it was for a long, lower for a short.
+       Added 2026-09-21; see the table at SLOPE_BARS.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -58,6 +61,8 @@ Management (2 lots):
     trail      the stop sits TRAIL_DIST_PCT of the entry behind the best
                price, moved in TRAIL_STEP_PCT steps, and never below the
                candle stop. No partial booking, no line exit.
+    lock       once the trade has run LOCK_AT_R times its initial risk, the
+               stop is never worse than LOCK_TO_R times that risk in profit.
     broker     the resting broker stop is a mechanical-failure backstop only.
     15:00      everything is squared off
 
@@ -206,6 +211,23 @@ TARGET_POLL_SECONDS = 5
 # docstring, on its third appearance. If the late engagement bothers you the
 # lever is TRAIL_DIST_PCT, not earlier protection.
 # Reproduce: backtests/nifty_percent_trail_replay.py, replay(lock_pts=30).
+#
+# ADOPTED 2026-09-21, user's decision, together with SLOPE_BARS: a lock sized
+# in R rather than fixed points, set late enough to leave the winners alone.
+# Once the trade has run LOCK_AT_R x its initial risk (entry to the buffered
+# stop), the stop is lifted to at least LOCK_TO_R x risk in profit. Median risk
+# is ~40 pts, so it arms around +60 - just under the winners' median favourable
+# move above - where the fixed 20-50 pt locks armed on ordinary noise. Replayed
+# with the slope filter, 2018-01..2026-09, net of 3 pts:
+#
+#                          net     PF   maxDD   win 2018-22 / 2023-26
+#     slope, no lock     +4,710   1.26  -1,149   37.2% / 45.5%
+#     slope + lock       +4,512   1.26  -1,091   40.6% / 48.9%
+#
+# It costs ~200 points over nine years for ~3.5 points of win rate and a
+# slightly shallower drawdown - a comfort trade, not an edge. None disables it.
+LOCK_AT_R = 1.5                     # arm once the best move reaches this many R
+LOCK_TO_R = 0.5                     # then the stop is at least this many R in profit
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
@@ -253,6 +275,24 @@ TICK = 0.05                         # NFO option tick
 # January, February, August and September. In September 2026 it takes NONE - the
 # strategy simply stands aside until volatility returns.
 VIX_MIN = 10.0
+
+# Trend filter, added 2026-09-21 on the user's decision: take a long only when
+# SMA(45) on candle 2 is higher than it was SLOPE_BARS candles earlier, a short
+# only when it is lower. None disables it. Replayed 2018-01..2026-09 with every
+# other setting as live (VIX 10, 10:30-14:30, 2 a day), net of 3 pts a trade:
+#
+#                        trades    net     PF   maxDD   losing years
+#     no slope filter     1,497  +2,972   1.10  -1,833       4
+#     slope over 3          1,071  +4,785   1.24  -1,106       3
+#     slope over 6            973  +4,710   1.26  -1,149       2
+#     slope over 12           903  +4,627   1.28  -1,038       2
+#
+# The length barely matters, so 6 is not a fitted optimum. It helps in both
+# halves: 2023-26 PF 1.30 -> 1.59; 2018-22 goes from -992 to -53, i.e. it cuts
+# the losses of the bad years rather than creating an edge in them. Found on
+# SENSEX first and carried here. On BANKNIFTY it HURTS, so it is not in that copy.
+# Reproduce: session 684aa630 scratchpad sensex/other.py, other2.py.
+SLOPE_BARS = 6
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1
@@ -714,6 +754,8 @@ def build_frame(client) -> pd.DataFrame:
 
     # SMA(45) spans prior sessions, so it is computed before today is sliced out.
     combined["sma"] = combined["close"].rolling(SMA_PERIOD).mean()
+    if SLOPE_BARS:
+        combined["sma_slope"] = combined["sma"] - combined["sma"].shift(SLOPE_BARS)
     is_today = [stamp.date() == today for stamp in combined.index]
 
     frame = combined[is_today].copy()
@@ -802,6 +844,13 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
             continue
         if direction == "short" and second["close"] >= first["low"]:
             continue
+        if SLOPE_BARS:
+            slope = float(second.get("sma_slope", float("nan")))
+            # NaN fails both comparisons, so an unreadable slope skips.
+            if not (slope > 0 if direction == "long" else slope < 0):
+                log(f"{direction} signal skipped: SMA({SMA_PERIOD}) moved "
+                    f"{slope:+.2f} over {SLOPE_BARS} bars, against the trade")
+                continue
         return {
             "direction": direction,
             "c1_low": float(first["low"]),
@@ -1326,6 +1375,17 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
         if moved != stop:
             position["stop"] = moved
             log(f"trail: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
+            stop = moved
+
+    # Profit lock, applied after the trail so it only ever tightens further.
+    risk = float(position.get("risk") or 0.0)
+    if LOCK_AT_R is not None and risk > 0 and position["mfe"] >= LOCK_AT_R * risk:
+        floor = entry + LOCK_TO_R * risk if long else entry - LOCK_TO_R * risk
+        moved = max(stop, floor) if long else min(stop, floor)
+        if moved != stop:
+            position["stop"] = moved
+            log(f"lock: best +{position['mfe']:.2f} pts is {LOCK_AT_R}R of "
+                f"{risk:.2f}, stop {stop:.2f} -> {moved:.2f} (+{LOCK_TO_R}R)")
 
     state["position"] = position
     return state
@@ -1553,6 +1613,8 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
+    log(f"filters: VIX >= {VIX_MIN}, SMA slope over {SLOPE_BARS} bars; "
+        f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)
