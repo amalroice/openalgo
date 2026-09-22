@@ -17,12 +17,14 @@ Entry (long; short is the mirror):
     entry hour climbed monotonically from -7.58 index points at 09h to +9.89
     at 13h; skipping the first hour turned that year from -329.7 points to
     +541.5 and halved the drawdown.
-    4. India VIX at or above VIX_MIN (10 since 2026-09-21; it was above 12,
+    4. India VIX at or above VIX_MIN (11 since 2026-09-22, 10 from
+       2026-09-21; it was above 12,
        which stood the strategy down through September 2026 - see the table
        at VIX_MIN for why 12 was chosen).
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
-       Added 2026-09-21; see the table at SLOPE_BARS.
+       Added 2026-09-21, switched OFF 2026-09-22 (SLOPE_BARS = None); see
+       the table at SLOPE_BARS.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -254,7 +256,8 @@ TICK = 0.05                         # NFO option tick
 
 # Regime filter: take no signal below this India VIX. Set to None to disable.
 # Lowered from 12 (at or below skipped) to 10 (10.00 and up trades) on
-# 2026-09-21 by the user's decision; the table below is the case for 12.
+# 2026-09-21 by the user's decision, then raised to 11 (11.00 and up trades) on
+# 2026-09-22, also the user's decision; the table below is the case for 12.
 #
 # Backtested 2026-01-01 to 2026-09-10, 171 sessions, VIX read on the signal bar
 # itself so there is no lookahead. Splitting every unfiltered trade by the VIX at
@@ -274,7 +277,7 @@ TICK = 0.05                         # NFO option tick
 # Know what this does in a calm tape: through 2026 it removes trades only in
 # January, February, August and September. In September 2026 it takes NONE - the
 # strategy simply stands aside until volatility returns.
-VIX_MIN = 10.0
+VIX_MIN = 11.0
 
 # Trend filter, added 2026-09-21 on the user's decision: take a long only when
 # SMA(45) on candle 2 is higher than it was SLOPE_BARS candles earlier, a short
@@ -292,7 +295,14 @@ VIX_MIN = 10.0
 # the losses of the bad years rather than creating an edge in them. Found on
 # SENSEX first and carried here. On BANKNIFTY it HURTS, so it is not in that copy.
 # Reproduce: session 684aa630 scratchpad sensex/other.py, other2.py.
-SLOPE_BARS = 6
+#
+# SWITCHED OFF 2026-09-22 on the user's decision, after a day it blocked the
+# only setup and a month (2026-08-19..09-18) in which it cut the three
+# strategies' combined net from +Rs 2,507 to -Rs 9,110 - almost all of that one
+# blocked +Rs 12,009 short on 09-15. Over 2016-10..2026-09 at 1 lot, off vs on:
+# PF 1.09 vs 1.24, Sharpe 0.39 vs 0.76, maxDD -Rs 1.19L vs -0.72L. Set 6 to
+# restore.
+SLOPE_BARS = None
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1

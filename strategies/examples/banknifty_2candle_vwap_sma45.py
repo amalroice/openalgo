@@ -32,7 +32,7 @@ Entry (long; short is the mirror):
     entry hour climbed monotonically from -7.58 index points at 09h to +9.89
     at 13h; skipping the first hour turned that year from -329.7 points to
     +541.5 and halved the drawdown.
-    4. India VIX at or above VIX_MIN (10, the same as NIFTY since 2026-09-21).
+    4. India VIX at or above VIX_MIN (11 since 2026-09-22, the same as NIFTY).
        VIX_MAX is still honoured and is off.
     5. Stretch rule (this copy only): while India VIX is inside the STRETCH_VIX_LOW /
        STRETCH_VIX_HIGH band (now 14 and below), a buy's entry must be within
@@ -216,9 +216,10 @@ TICK = 0.05                         # NFO option tick
 
 # Regime filter. On BANKNIFTY (six-bank volume) no VIX band beat taking every
 # signal in total, over 2018-2026 or over the last two years; VIX_MIN = 10 was
-# set on 2026-09-21 by the user's decision to match NIFTY, not from a backtest.
+# set on 2026-09-21 by the user's decision to match NIFTY, not from a backtest,
+# and raised to 11 on 2026-09-22, again the user's decision, again to match NIFTY.
 # Signals trade at VIX_MIN and above, and only below VIX_MAX.
-VIX_MIN = 10.0
+VIX_MIN = 11.0
 VIX_MAX = None
 
 # Stretch rule. While India VIX is above STRETCH_VIX_LOW and up to STRETCH_VIX_HIGH

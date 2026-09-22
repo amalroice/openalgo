@@ -15,7 +15,7 @@ Entry (long; short is the mirror):
     4. WITH THE DAY: candle 2 closes above today's opening price (short:
        below it). See WITH_THE_DAY.
     5. SMA(45) on candle 2 is higher than SLOPE_BARS candles earlier (short:
-       lower). See SLOPE_BARS.
+       lower). Switched OFF 2026-09-22 (SLOPE_BARS = None); see SLOPE_BARS.
     Entries only between NO_NEW_ENTRY_BEFORE and NO_NEW_ENTRY_AFTER, at most
     MAX_TRADES_PER_DAY. No VIX filter - on SENSEX it changed nothing.
 
@@ -154,8 +154,13 @@ VIX_MIN = None
 # short below it. SLOPE_BARS: SMA(45) must have moved in the trade's direction
 # over that many candles; 3 and 12 give PF 1.20 and 1.23 overall. False / None
 # disables either.
+#
+# SLOPE_BARS SWITCHED OFF 2026-09-22 on the user's decision, together with
+# NIFTY's. Over 2016-10..2026-09 at 1 lot, off vs on: PF 1.18 vs 1.23, Sharpe
+# 0.70 vs 0.70, maxDD -Rs 0.69L vs -0.52L, net +Rs 3.01L vs +2.58L. Last month
+# (2026-08-19..09-18) it made no difference. Set 6 to restore.
 WITH_THE_DAY = True
-SLOPE_BARS = 6
+SLOPE_BARS = None
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 # NIFTY's 10/25 scaled by the index ratio (~3.3) is 33/82. The wider 50 buffer
