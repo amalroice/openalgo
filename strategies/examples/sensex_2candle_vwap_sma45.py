@@ -16,6 +16,9 @@ Entry (long; short is the mirror):
        below it). See WITH_THE_DAY.
     5. SMA(45) on candle 2 is higher than SLOPE_BARS candles earlier (short:
        lower). Switched OFF 2026-09-22 (SLOPE_BARS = None); see SLOPE_BARS.
+    6. NIFTY 50 breadth leans with the trade: advancers at least ADR_MIN
+       (1.5) times decliners for a long, the reverse for a short, read from
+       multiquotes when the signal fires. Added 2026-09-22; see ADR_MIN.
     Entries only between NO_NEW_ENTRY_BEFORE and NO_NEW_ENTRY_AFTER, at most
     MAX_TRADES_PER_DAY. No VIX filter - on SENSEX it changed nothing.
 
@@ -162,6 +165,24 @@ VIX_MIN = None
 WITH_THE_DAY = True
 SLOPE_BARS = None
 
+# Breadth gate, added 2026-09-22 on the user's decision, the same rule as the
+# NIFTY copy: the NIFTY 50 advance-decline ratio (BREADTH_CONSTITUENTS above vs
+# below their own previous close) must lean with the trade by ADR_MIN -
+# advancers at least 1.5x decliners for a long, the reverse for a short. Read
+# once from multiquotes when a signal fires. None disables it. NIFTY 50 beat
+# SENSEX's own 30 stocks as the breadth source. SENSEX alone, 1 lot:
+#
+#                        2016-10..2026-09                      last 2y                  last month
+#     no breadth        +3.01L PF 1.18 Sh 0.70 DD -69k 2 losing   +1.29L PF 1.31 Sh 1.17   12 trades -6,147
+#     own SENSEX 30     +3.15L PF 1.34 Sh 0.90 DD -59k 3 losing   +0.88L PF 1.34 Sh 0.95    9 trades -8,569
+#     NIFTY 50 >= 1.5   +3.17L PF 1.36 Sh 0.92 DD -38k 1 losing   +1.20L PF 1.51 Sh 1.31    8 trades -9,931
+#
+# Worse in the last month: it dropped the 08-24 and 09-11 winners. The backtest
+# uses today's constituents throughout, so older years flatter it. Reproduce:
+# session febea895 scratchpad bnf_sx_adr.py.
+ADR_MIN = 1.5
+ADR_MIN_STOCKS = 40                 # skip the signal if fewer quotes are readable
+
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 # NIFTY's 10/25 scaled by the index ratio (~3.3) is 33/82. The wider 50 buffer
 # was better in both halves (PF 1.05 / 1.25 alone against 1.01 / 1.20); 40 and
@@ -196,6 +217,21 @@ CONSTITUENTS = [
     "LT", "M&M", "MARUTI", "NTPC", "POWERGRID",
     "RELIANCE", "SBIN", "SUNPHARMA", "TATASTEEL", "TCS",
     "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "TMPV",
+]
+
+# NIFTY 50, for the breadth gate only - the same list as the NIFTY copy's
+# CONSTITUENTS, verified against the Angel symbol master on 2026-09-07.
+BREADTH_CONSTITUENTS = [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
+    "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL",
+    "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO",
+    "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY",
+    "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT",
+    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
+    "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL", "TCS",
+    "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
 ]
 
 _shutdown = False
@@ -667,6 +703,43 @@ def read_vix(client) -> float | None:
         return None
     d = q.get("data") or {}
     return float(d.get("ltp") or d.get("prev_close") or 0) or None
+
+
+def read_breadth(client) -> tuple[int, int] | None:
+    """NIFTY 50 advancers and decliners against each stock's previous close.
+
+    Returns:
+        (advancers, decliners), or None when fewer than ADR_MIN_STOCKS
+        constituents return a usable quote.
+    """
+    symbols = [{"symbol": s, "exchange": EQUITY_EXCHANGE} for s in BREADTH_CONSTITUENTS]
+    try:
+        q = client.multiquotes(symbols=symbols)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"breadth multiquotes raised {exc!r}")
+        return None
+    if not ok(q):
+        log(f"breadth multiquotes failed: {q}")
+        return None
+    advancers = decliners = readable = 0
+    for item in q.get("results") or []:
+        d = item.get("data") or {}
+        try:
+            ltp = float(d.get("ltp") or 0)
+            prev = float(d.get("prev_close") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ltp <= 0 or prev <= 0:
+            continue
+        readable += 1
+        if ltp > prev:
+            advancers += 1
+        elif ltp < prev:
+            decliners += 1
+    if readable < ADR_MIN_STOCKS:
+        log(f"breadth: only {readable}/{len(BREADTH_CONSTITUENTS)} quotes readable")
+        return None
+    return advancers, decliners
 
 
 # =============================================================================
@@ -1372,6 +1445,20 @@ def cycle(client, state: dict) -> dict:
             return state
         log(f"India VIX {vix:.2f} clears VIX_MIN {VIX_MIN}")
 
+    if ADR_MIN is not None:
+        breadth = read_breadth(client)
+        if breadth is None:
+            # Same reasoning as the VIX gate: no reading, no trade.
+            log("breadth unreadable; skipping this signal")
+            return state
+        adv, dec = breadth
+        with_trade, against = (adv, dec) if sig["direction"] == "long" else (dec, adv)
+        if not (with_trade > 0 and with_trade >= ADR_MIN * against):
+            log(f"{sig['direction']} signal skipped: NIFTY 50 {adv} advancing / {dec} "
+                f"declining, needs {ADR_MIN}x in the trade's direction")
+            return state
+        log(f"breadth NIFTY 50 {adv} advancing / {dec} declining clears ADR_MIN {ADR_MIN}")
+
     stop = initial_stop(sig)
     spot = float(frame["close"].iloc[-1])
     risk = (spot - stop) if sig["direction"] == "long" else (stop - spot)
@@ -1513,7 +1600,7 @@ def main() -> int:
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
     log(f"filters: with the day {WITH_THE_DAY}, SMA slope over {SLOPE_BARS} "
-        f"bars, VIX {VIX_MIN}; buffer {STOP_BUFFER:.0f}; lock +{LOCK_TO_R}R once "
+        f"bars, VIX {VIX_MIN}, NIFTY 50 advance-decline >= {ADR_MIN}x; buffer {STOP_BUFFER:.0f}; lock +{LOCK_TO_R}R once "
         f"+{LOCK_AT_R}R; {'DRY RUN - nothing is sent' if DRY_RUN else 'LIVE ORDERS'}")
 
     if USE_WEBSOCKET_VOLUME:
