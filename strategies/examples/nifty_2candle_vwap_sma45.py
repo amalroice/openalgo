@@ -23,8 +23,8 @@ Entry (long; short is the mirror):
        at VIX_MIN for why 12 was chosen).
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
-       Added 2026-09-21, switched OFF 2026-09-22 (SLOPE_BARS = None); see
-       the table at SLOPE_BARS.
+       Added 2026-09-21; briefly off on 2026-09-22 and back on the same
+       evening. See the tables at SLOPE_BARS.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -313,9 +313,18 @@ VIX_MIN = 11.0
 # only setup and a month (2026-08-19..09-18) in which it cut the three
 # strategies' combined net from +Rs 2,507 to -Rs 9,110 - almost all of that one
 # blocked +Rs 12,009 short on 09-15. Over 2016-10..2026-09 at 1 lot, off vs on:
-# PF 1.09 vs 1.24, Sharpe 0.39 vs 0.76, maxDD -Rs 1.19L vs -0.72L. Set 6 to
-# restore.
-SLOPE_BARS = None
+# PF 1.09 vs 1.24, Sharpe 0.39 vs 0.76, maxDD -Rs 1.19L vs -0.72L.
+#
+# SWITCHED BACK ON the same evening, on the user's decision, with the new
+# 0.4% / 0.1% trail and VIX 11. NIFTY alone, 1 lot, off vs on:
+#
+#                     2023-2026                 last 2y                  2016-10..2026-09
+#     slope off   +2.59L PF 1.35 DD -44k   +1.80L PF 1.40 Sh 1.54   +1.62L PF 1.09 Sh 0.38
+#     slope on    +3.00L PF 1.67 DD -26k   +1.89L PF 1.70 Sh 1.85   +3.05L PF 1.27 Sh 0.83
+#
+# Better in every window but the last month. SENSEX keeps it off; BANKNIFTY
+# never had it. Reproduce: session 06861671 scratchpad nifty_slope_trail.py.
+SLOPE_BARS = 6
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1
