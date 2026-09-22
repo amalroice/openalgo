@@ -25,6 +25,9 @@ Entry (long; short is the mirror):
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
        Added 2026-09-21 over 6 bars, switched off 2026-09-22, back on that
        night over 2 bars on the user's decision. See the tables at SLOPE_BARS.
+    6. NIFTY 50 breadth leans with the trade: advancers at least ADR_MIN
+       (1.5) times decliners for a long, the reverse for a short, read from
+       multiquotes when the signal fires. Added 2026-09-22; see ADR_MIN.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -342,6 +345,24 @@ VIX_MIN = 11.0
 # length lost the last month (2026-08-19..09-18). Reproduce: session febea895
 # scratchpad nifty_slope_bars.py.
 SLOPE_BARS = 2
+
+# Breadth gate, added 2026-09-22 on the user's decision, on top of the slope:
+# the NIFTY 50 advance-decline ratio (constituents above vs below their own
+# previous close) must lean with the trade by at least ADR_MIN - advancers at
+# least 1.5x decliners for a long, decliners at least 1.5x advancers for a
+# short. Read once from multiquotes when a signal fires. None disables it.
+# NIFTY alone, 1 lot, slope over 2, same trail and VIX 11:
+#
+#                     2016-10..2026-09                last 2y                        last month
+#     slope 2 only   +2.70L PF 1.20 DD -86k   +2.03L PF 1.66 Sh 1.91 DD -27k   8 trades -8,775
+#     + ADR >= 1.5   +2.31L PF 1.30 DD -87k   +1.95L PF 2.09 Sh 2.05 DD -16k   5 trades -12,496
+#
+# Fewer, better trades over two years; worse in the last month, where it
+# removed two winners (08-24, 09-11) and one small loser (08-21). The backtest
+# uses today's constituents throughout, so older years flatter it. Reproduce:
+# session febea895 scratchpad nifty_slope_adr.py, nifty_month_trades.py.
+ADR_MIN = 1.5
+ADR_MIN_STOCKS = 40                 # skip the signal if fewer quotes are readable
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1
@@ -847,6 +868,43 @@ def read_vix(client) -> float | None:
         return None
     d = q.get("data") or {}
     return float(d.get("ltp") or d.get("prev_close") or 0) or None
+
+
+def read_breadth(client) -> tuple[int, int] | None:
+    """NIFTY 50 advancers and decliners against each stock's previous close.
+
+    Returns:
+        (advancers, decliners), or None when fewer than ADR_MIN_STOCKS
+        constituents return a usable quote.
+    """
+    symbols = [{"symbol": s, "exchange": EQUITY_EXCHANGE} for s in CONSTITUENTS]
+    try:
+        q = client.multiquotes(symbols=symbols)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"breadth multiquotes raised {exc!r}")
+        return None
+    if not ok(q):
+        log(f"breadth multiquotes failed: {q}")
+        return None
+    advancers = decliners = readable = 0
+    for item in q.get("results") or []:
+        d = item.get("data") or {}
+        try:
+            ltp = float(d.get("ltp") or 0)
+            prev = float(d.get("prev_close") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ltp <= 0 or prev <= 0:
+            continue
+        readable += 1
+        if ltp > prev:
+            advancers += 1
+        elif ltp < prev:
+            decliners += 1
+    if readable < ADR_MIN_STOCKS:
+        log(f"breadth: only {readable}/{len(CONSTITUENTS)} quotes readable")
+        return None
+    return advancers, decliners
 
 
 # =============================================================================
@@ -1522,6 +1580,20 @@ def cycle(client, state: dict) -> dict:
             return state
         log(f"India VIX {vix:.2f} clears VIX_MIN {VIX_MIN}")
 
+    if ADR_MIN is not None:
+        breadth = read_breadth(client)
+        if breadth is None:
+            # Same reasoning as the VIX gate: no reading, no trade.
+            log("breadth unreadable; skipping this signal")
+            return state
+        adv, dec = breadth
+        with_trade, against = (adv, dec) if sig["direction"] == "long" else (dec, adv)
+        if not (with_trade > 0 and with_trade >= ADR_MIN * against):
+            log(f"{sig['direction']} signal skipped: {adv} advancing / {dec} declining, "
+                f"needs {ADR_MIN}x in the trade's direction")
+            return state
+        log(f"breadth {adv} advancing / {dec} declining clears ADR_MIN {ADR_MIN}")
+
     stop = initial_stop(sig)
     spot = float(frame["close"].iloc[-1])
     risk = (spot - stop) if sig["direction"] == "long" else (stop - spot)
@@ -1662,7 +1734,8 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
-    log(f"filters: VIX >= {VIX_MIN}, SMA slope over {SLOPE_BARS} bars; "
+    log(f"filters: VIX >= {VIX_MIN}, SMA slope over {SLOPE_BARS} bars, "
+        f"advance-decline >= {ADR_MIN}x; "
         f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R")
 
     if USE_WEBSOCKET_VOLUME:
