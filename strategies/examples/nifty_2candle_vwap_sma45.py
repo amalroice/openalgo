@@ -24,7 +24,8 @@ Entry (long; short is the mirror):
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
        Added 2026-09-21 over 6 bars, switched off 2026-09-22, back on that
-       night over 2 bars on the user's decision. See the tables at SLOPE_BARS.
+       night over 2 bars, then off again (SLOPE_BARS = None) in favour of
+       the breadth gate alone. See the tables at SLOPE_BARS.
     6. NIFTY 50 breadth leans with the trade: advancers at least ADR_MIN
        (1.5) times decliners for a long, the reverse for a short, read from
        multiquotes when the signal fires. Added 2026-09-22; see ADR_MIN.
@@ -344,9 +345,17 @@ VIX_MIN = 11.0
 # 2 trails 3 and 6 over ten years but matches them in the last two. Every
 # length lost the last month (2026-08-19..09-18). Reproduce: session febea895
 # scratchpad nifty_slope_bars.py.
-SLOPE_BARS = 2
+#
+# OFF again the same night, on the user's decision, leaving the breadth gate
+# (ADR_MIN) as the only trend filter. Last month (2026-08-19..09-18): slope 2
+# + ADR -12,496 on 5 trades, ADR alone -487 on 6 - the gap is the +12,009
+# 09-15 short, which any slope length blocks. Last 2y ADR alone: +2.28L PF 2.09
+# Sh 2.26 DD -27k. Reproduce: session febea895 scratchpad
+# nifty_month_adr_alone.py. Set 2 to restore.
+SLOPE_BARS = None
 
-# Breadth gate, added 2026-09-22 on the user's decision, on top of the slope:
+# Breadth gate, added 2026-09-22 on the user's decision, first on top of the
+# slope and, from later that night, on its own (SLOPE_BARS = None):
 # the NIFTY 50 advance-decline ratio (constituents above vs below their own
 # previous close) must lean with the trade by at least ADR_MIN - advancers at
 # least 1.5x decliners for a long, decliners at least 1.5x advancers for a
