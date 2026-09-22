@@ -17,10 +17,9 @@ Entry (long; short is the mirror):
     entry hour climbed monotonically from -7.58 index points at 09h to +9.89
     at 13h; skipping the first hour turned that year from -329.7 points to
     +541.5 and halved the drawdown.
-    4. India VIX at or above VIX_MIN (11 since 2026-09-22, 10 from
-       2026-09-21; it was above 12,
-       which stood the strategy down through September 2026 - see the table
-       at VIX_MIN for why 12 was chosen).
+    4. India VIX at or above VIX_MIN - OFF since 2026-09-22 night
+       (VIX_MIN = None), replaced by the breadth gate in 6. It was 11 earlier
+       that day, 10 from 2026-09-21, and 12 before that; see VIX_MIN.
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
        Added 2026-09-21 over 6 bars, switched off 2026-09-22, back on that
@@ -294,7 +293,18 @@ TICK = 0.05                         # NFO option tick
 # Know what this does in a calm tape: through 2026 it removes trades only in
 # January, February, August and September. In September 2026 it takes NONE - the
 # strategy simply stands aside until volatility returns.
-VIX_MIN = 11.0
+#
+# SWITCHED OFF 2026-09-22 night, on the user's decision, once the breadth gate
+# (ADR_MIN) went in. NIFTY alone, 1 lot, slope off, ADR >= 1.5 on:
+#
+#                  2016-10..2026-09          last 2y                   last month
+#     VIX 11     +2.51L PF 1.27 DD -99k   +2.28L PF 2.09 Sh 2.26   6 trades   -487
+#     VIX off    +2.79L PF 1.29 DD -91k   +2.49L PF 2.10 Sh 2.40   7 trades -1,615
+#
+# Breadth does the regime job; the floor only cost trades. Last month's one
+# extra trade is the 08-26 short, -1,128. Reproduce: session febea895
+# scratchpad nifty_vix_adr.py. Set 11.0 to restore.
+VIX_MIN = None
 
 # Trend filter, added 2026-09-21 on the user's decision: take a long only when
 # SMA(45) on candle 2 is higher than it was SLOPE_BARS candles earlier, a short
