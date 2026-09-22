@@ -23,8 +23,8 @@ Entry (long; short is the mirror):
        at VIX_MIN for why 12 was chosen).
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
-       Added 2026-09-21; briefly off on 2026-09-22 and back on the same
-       evening. See the tables at SLOPE_BARS.
+       Added 2026-09-21, switched OFF 2026-09-22 (SLOPE_BARS = None) on the
+       user's decision. See the tables at SLOPE_BARS.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -324,7 +324,11 @@ VIX_MIN = 11.0
 #
 # Better in every window but the last month. SENSEX keeps it off; BANKNIFTY
 # never had it. Reproduce: session 06861671 scratchpad nifty_slope_trail.py.
-SLOPE_BARS = 6
+#
+# SWITCHED OFF AGAIN, for good, later on 2026-09-22 by the user's decision:
+# no slope filter on any strategy, at any VIX level, to keep the rules simple.
+# The tables above still stand; set 6 to restore.
+SLOPE_BARS = None
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1

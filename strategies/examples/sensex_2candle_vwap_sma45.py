@@ -155,8 +155,8 @@ VIX_MIN = None
 # over that many candles; 3 and 12 give PF 1.20 and 1.23 overall. False / None
 # disables either.
 #
-# SLOPE_BARS SWITCHED OFF 2026-09-22 on the user's decision. NIFTY's was
-# switched off with it but turned back on the same evening; SENSEX stays off. Over 2016-10..2026-09 at 1 lot, off vs on: PF 1.18 vs 1.23, Sharpe
+# SLOPE_BARS SWITCHED OFF 2026-09-22 on the user's decision; no strategy uses
+# a slope filter. Over 2016-10..2026-09 at 1 lot, off vs on: PF 1.18 vs 1.23, Sharpe
 # 0.70 vs 0.70, maxDD -Rs 0.69L vs -0.52L, net +Rs 3.01L vs +2.58L. Last month
 # (2026-08-19..09-18) it made no difference. Set 6 to restore.
 WITH_THE_DAY = True
