@@ -162,8 +162,21 @@ LOTS = 1                            # cut from 2 on 2026-09-20 for the first liv
 # in every window, cutting 2018-2021 from -1,594 to between -310 and -869. A
 # whole-row effect, not one lucky cell - but untested out of sample and not
 # adopted. Do not change the distance on the strength of that sweep alone.
-TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
-TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
+#
+# TIGHTENED to 0.4% / 0.1% on 2026-09-22 by the user's decision, favouring
+# recent years. Re-run on the live config of that evening (slope off, VIX 11,
+# 1 lot, Rs = net index pts x 65), 0.4%/0.1% vs 0.5%/0.2%:
+#
+#                      2023-2026                 last 2y                  2016-10..2026-09
+#     0.5% / 0.2%   +2.47L PF 1.32 DD -55k   +1.76L PF 1.37 DD -55k   +1.64L PF 1.09 DD -1.24L
+#     0.4% / 0.1%   +2.59L PF 1.35 DD -44k   +1.80L PF 1.40 DD -44k   +1.62L PF 1.09 DD -1.32L
+#
+# A small, recent-only gain; the full window is a tie. Tighter than 0.4% loses
+# in every window (0.3%: 10y +0.52L, 0.2%: -0.99L). A VIX-switched version
+# (tight only at VIX <= 14) was no better than either. Set 0.005 / 0.002 to
+# restore. Reproduce: session 06861671 scratchpad trail_tight.py, trail_vix2.py.
+TRAIL_DIST_PCT = 0.004              # stop distance behind the best price
+TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
 
 # Profit booking and the close stop, added 2026-09-21 on the user's rule and
 # switched off after the backtest below. R is the entry less candle 1's LOW (a short: candle 1's
