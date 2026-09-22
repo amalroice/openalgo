@@ -23,8 +23,8 @@ Entry (long; short is the mirror):
        at VIX_MIN for why 12 was chosen).
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
-       Added 2026-09-21, switched OFF 2026-09-22 (SLOPE_BARS = None) on the
-       user's decision. See the tables at SLOPE_BARS.
+       Added 2026-09-21 over 6 bars, switched off 2026-09-22, back on that
+       night over 2 bars on the user's decision. See the tables at SLOPE_BARS.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -325,10 +325,23 @@ VIX_MIN = 11.0
 # Better in every window but the last month. SENSEX keeps it off; BANKNIFTY
 # never had it. Reproduce: session 06861671 scratchpad nifty_slope_trail.py.
 #
-# SWITCHED OFF AGAIN, for good, later on 2026-09-22 by the user's decision:
-# no slope filter on any strategy, at any VIX level, to keep the rules simple.
-# The tables above still stand; set 6 to restore.
-SLOPE_BARS = None
+# SWITCHED OFF AGAIN later on 2026-09-22 by the user's decision, to keep the
+# rules simple.
+#
+# BACK ON over 2 bars, same night, on the user's decision. The 6-bar filter
+# had blocked that morning's 10:40 short (slope +3.21 over 6 bars, +0.41 over
+# 3, -0.12 over 2). NIFTY alone, 1 lot, same trail and VIX 11:
+#
+#                   2016-10..2026-09                 2023 onwards        last 2y
+#     no filter   +1.62L PF 1.09 Sh 0.38 DD -1.32L   +2.59L PF 1.35   +1.80L PF 1.40 Sh 1.54
+#     over 2      +2.70L PF 1.20 Sh 0.70 DD -0.86L   +3.12L PF 1.60   +2.03L PF 1.66 Sh 1.91
+#     over 3      +2.87L PF 1.23 Sh 0.76 DD -0.83L   +3.16L PF 1.63   +1.96L PF 1.66 Sh 1.90
+#     over 6      +3.05L PF 1.27 Sh 0.83 DD -0.63L   +3.00L PF 1.67   +1.89L PF 1.70 Sh 1.85
+#
+# 2 trails 3 and 6 over ten years but matches them in the last two. Every
+# length lost the last month (2026-08-19..09-18). Reproduce: session febea895
+# scratchpad nifty_slope_bars.py.
+SLOPE_BARS = 2
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1
