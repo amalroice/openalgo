@@ -217,6 +217,31 @@ DIRECTIONS = ("long", "short")      # sides to trade
 # where any-pair has no edge at all (PF 1.01-1.03 in every window).
 FIRST_PAIR_ONLY = False
 
+# Regime switch on top of FIRST_PAIR_ONLY: while India VIX is at or below
+# FIRST_PAIR_VIX_MAX the pair must still be the first of its run; above it, any
+# qualifying pair may trigger. None disables the switch and FIRST_PAIR_ONLY alone
+# decides. An unreadable VIX falls back to requiring the first pair.
+#
+# The two rules are good in opposite regimes. Split by VIX at entry, 10 years,
+# 1 lot of 30, cost 4 (net Rs / PF):
+#
+#     VIX at entry     first pair        any pair
+#        10 - 12     +94,971  2.29   +121,161  1.69
+#        12 - 14     +52,618  1.88    -14,290  0.93
+#        14 - 16        -200  1.00   +133,344  1.11
+#        above 16   +152,718  1.17   +278,222  1.10
+#
+# Any-pair earns its keep only above 14, and actually loses money in 12-14 where
+# first-pair posts its best recent bucket. Switching at 14 beats flat any-pair on
+# net, PF and Sharpe in every window (10y +554,833 PF 1.13 vs +511,010 PF 1.11;
+# last 2y +245,449 PF 1.31 vs +189,313 PF 1.21; last 1y +222,935 PF 1.73 vs
+# +195,263 PF 1.54), with drawdown a wash on 10y and better on every shorter one.
+# Not a knife-edge: 13 through 18 all sit on a plateau (PF 1.12-1.16 over 10y),
+# net peaks at 14, and 14 is already the STRETCH_VIX_HIGH threshold, so both
+# switches flip together. Some of 14's margin over its neighbours is selection -
+# the threshold was chosen after seeing the table above.
+FIRST_PAIR_VIX_MAX = 14.0
+
 # Resting stop parked at the broker on entry, so a dead machine or a dropped
 # link cannot leave the option unprotected. The in-process trail above is still
 # what normally exits; this only catches the session nobody is watching.
@@ -244,7 +269,10 @@ TICK = 0.05                         # NFO option tick
 # on the user's decision: only NIFTY keeps a VIX floor. The stretch rule below
 # still reads VIX for its own band. Signals trade at VIX_MIN and above, and only
 # below VIX_MAX; None disables either side.
-VIX_MIN = None
+# Floor added 2026-09-23. India VIX under 10 is rare - 18 sessions in ten years -
+# and every trade taken there lost: 6 trades, 0% win, -11,994 on the first-pair
+# rule. Removing them is worth +12,000 over ten years. Insurance, not an edge.
+VIX_MIN = 10.0
 VIX_MAX = None
 
 # Stretch rule. While India VIX is above STRETCH_VIX_LOW and up to STRETCH_VIX_HIGH
@@ -769,6 +797,29 @@ def build_frame(client) -> pd.DataFrame:
     return frame.dropna(subset=["vwap", "sma"])
 
 
+_VIX_CACHE: dict[str, float | None] = {}
+
+
+def read_vix_cached(client, key: str) -> float | None:
+    """India VIX for one bar, read at most once however many gates ask for it.
+
+    The pair rule, the VIX floor and the stretch rule can all want the quote on
+    the same bar. The cache holds a single entry - it is cleared before each new
+    key - so it cannot grow over a session.
+
+    Args:
+        client: OpenAlgo client.
+        key: identifies the bar; a new one invalidates the previous read.
+
+    Returns:
+        The last traded VIX, or None when it cannot be read.
+    """
+    if key not in _VIX_CACHE:
+        _VIX_CACHE.clear()
+        _VIX_CACHE[key] = read_vix(client)
+    return _VIX_CACHE[key]
+
+
 def read_vix(client) -> float | None:
     """India VIX right now, used as the regime gate on a fresh signal.
 
@@ -791,8 +842,13 @@ def read_vix(client) -> float | None:
 # SIGNAL
 # =============================================================================
 
-def latest_signal(frame: pd.DataFrame) -> dict | None:
-    """Test the two most recently completed candles for a first-pair breakout.
+def latest_signal(frame: pd.DataFrame, vix_getter=None) -> dict | None:
+    """Test the two most recently completed candles for a qualifying breakout.
+
+    Args:
+        frame: the session frame, last row being the most recent closed candle.
+        vix_getter: zero-argument callable returning India VIX, or None. Called
+            at most once, and only when a mid-run pair makes the answer matter.
 
     Returns:
         Signal dict, or None when the last pair does not qualify.
@@ -810,10 +866,20 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
         if not (bool(first[flag]) and bool(second[flag])):
             continue
         # The run has to begin at candle 1, so the candle before it must not
-        # already have been clear of both lines. Off since 2026-09-23,
-        # see FIRST_PAIR_ONLY.
-        if FIRST_PAIR_ONLY and bool(before[flag]) and frame.index[-3].date() == today:
-            continue
+        # already have been clear of both lines. Since 2026-09-23 this is
+        # required only in a calm regime - see FIRST_PAIR_ONLY and
+        # FIRST_PAIR_VIX_MAX.
+        mid_run = bool(before[flag]) and frame.index[-3].date() == today
+        if mid_run:
+            need_first = FIRST_PAIR_ONLY
+            if FIRST_PAIR_VIX_MAX is not None:
+                vix = vix_getter() if vix_getter else None
+                need_first = vix is None or vix <= FIRST_PAIR_VIX_MAX
+                if not need_first:
+                    log(f"{direction} pair is mid-run but India VIX {vix:.2f} is above "
+                        f"FIRST_PAIR_VIX_MAX {FIRST_PAIR_VIX_MAX}; allowed")
+            if need_first:
+                continue
         # Candle 2 must close clear of candle 1's RANGE, not merely its close:
         # above the high to buy a CE, below the low to buy a PE. Until
         # 2026-09-20 this compared closes, which was not the intended rule.
@@ -1476,12 +1542,13 @@ def cycle(client, state: dict) -> dict:
     if now.time() < NO_NEW_ENTRY_BEFORE:
         return state
 
-    sig = latest_signal(frame)
+    vix_key = f"{frame.index[-1]:%Y-%m-%d %H:%M}"
+    sig = latest_signal(frame, lambda: read_vix_cached(client, vix_key))
     if not sig:
         return state
 
     if VIX_MIN is not None or VIX_MAX is not None:
-        vix = read_vix(client)
+        vix = read_vix_cached(client, vix_key)
         if vix is None:
             # The whole point of the gate is to know the regime before committing,
             # so an unreadable VIX skips the signal rather than trading blind.
@@ -1501,7 +1568,7 @@ def cycle(client, state: dict) -> dict:
         stretch = entry_stretch(sig, frame)
         if stretch > STRETCH_MAX_PCT:
             # Only a stretched entry depends on the VIX band, so the quote is read here.
-            stretch_vix = read_vix(client)
+            stretch_vix = read_vix_cached(client, vix_key)
             if not stretch_allowed(stretch, stretch_vix):
                 regime = "unreadable" if stretch_vix is None else f"{stretch_vix:.2f}"
                 side = "low" if sig["direction"] == "long" else "high"
@@ -1650,7 +1717,8 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
-    log(f"pair rule: {'first pair of the run only' if FIRST_PAIR_ONLY else 'any qualifying pair'}; "
+    log(f"pair rule: {'first pair of the run only' if FIRST_PAIR_ONLY else 'any qualifying pair'}"
+        f"{f', first pair only while VIX <= {FIRST_PAIR_VIX_MAX}' if FIRST_PAIR_VIX_MAX else ''}; "
         f"entries {NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY} a day")
 
     if USE_WEBSOCKET_VOLUME:
