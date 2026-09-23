@@ -13,7 +13,7 @@ Entry (long; short is the mirror):
        closes below candle 1's LOW). Clearing candle 1's whole range, not just
        its close, is what makes this a breakout.
     Entry is a market order as soon as candle 2 closes, and never before
-    NO_NEW_ENTRY_BEFORE (10:00 since 2026-09-23; 10:30 before that). Over
+    NO_NEW_ENTRY_BEFORE (10:15 since 2026-09-23; 10:30 before that). Over
     2026-01-01 to 2026-09-09 the average trade by entry hour climbed
     monotonically from -7.58 index points at 09h to +9.89 at 13h; skipping the
     first hour turned that year from -329.7 points to +541.5 and halved the
@@ -391,7 +391,8 @@ LINE_PROXIMITY = 25.0               # swap to the line when it is this close
 SESSION_OPEN = dtime(9, 15)
 # Entries are allowed from NO_NEW_ENTRY_BEFORE, measured on candle 2's CLOSE
 # time (the wall clock when the signal is evaluated), until NO_NEW_ENTRY_AFTER.
-# Moved 10:30 -> 10:00 on 2026-09-23 at the user's request, live from 2026-09-24.
+# Moved 10:30 -> 10:15 on 2026-09-23 at the user's request, live from 2026-09-24
+# (10:00 first, then 10:15 the same evening once the bucket split below was in).
 #
 # Swept on this config (breadth ADR >= 1.5, no slope, no VIX, 0.4%/0.1% trail,
 # lock 1.5R -> 0.5R), 2016-10..2026-09, 1 lot of 75, cost 3 pts a trade:
@@ -405,11 +406,11 @@ SESSION_OPEN = dtime(9, 15)
 #     11:00   +148,100  1.16     +171,311  1.48       +224,014  2.13
 #
 # Split by the bucket each earlier start adds over 10 years: the 91 trades
-# entered 10:15-10:30 are worth +241 each, and the 146 entered 10:00-10:15
-# lose -244 each. 10:00 therefore buys back the good bucket and the bad one
-# together; 10:15 keeps only the good one. Told to the user 2026-09-23 with
-# 10:15 offered as the alternative - they asked for 10:00.
-NO_NEW_ENTRY_BEFORE = dtime(10, 0)
+# entered 10:15-10:30 are worth +241 each (48.4% win), and the 146 entered
+# 10:00-10:15 lose -244 each. 10:15 takes the profitable bucket without the
+# losing one, which is why it leads the 10-year net and is the only start
+# positive over 2026-08-19..09-18.
+NO_NEW_ENTRY_BEFORE = dtime(10, 15)
 NO_NEW_ENTRY_AFTER = dtime(14, 30)  # too close to square-off to be worth it
 SQUARE_OFF = dtime(15, 0)
 ABANDON_AFTER = dtime(15, 20)       # the exchange refuses MIS orders past 15:15
