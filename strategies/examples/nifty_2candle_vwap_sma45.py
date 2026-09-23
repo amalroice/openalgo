@@ -13,10 +13,11 @@ Entry (long; short is the mirror):
        closes below candle 1's LOW). Clearing candle 1's whole range, not just
        its close, is what makes this a breakout.
     Entry is a market order as soon as candle 2 closes, and never before
-    NO_NEW_ENTRY_BEFORE. Over 2026-01-01 to 2026-09-09 the average trade by
-    entry hour climbed monotonically from -7.58 index points at 09h to +9.89
-    at 13h; skipping the first hour turned that year from -329.7 points to
-    +541.5 and halved the drawdown.
+    NO_NEW_ENTRY_BEFORE (10:00 since 2026-09-23; 10:30 before that). Over
+    2026-01-01 to 2026-09-09 the average trade by entry hour climbed
+    monotonically from -7.58 index points at 09h to +9.89 at 13h; skipping the
+    first hour turned that year from -329.7 points to +541.5 and halved the
+    drawdown. The full start-time sweep is at NO_NEW_ENTRY_BEFORE.
     4. India VIX at or above VIX_MIN - OFF since 2026-09-22 night
        (VIX_MIN = None), replaced by the breadth gate in 6. It was 11 earlier
        that day, 10 from 2026-09-21, and 12 before that; see VIX_MIN.
@@ -388,7 +389,27 @@ STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1
 LINE_PROXIMITY = 25.0               # swap to the line when it is this close
 
 SESSION_OPEN = dtime(9, 15)
-NO_NEW_ENTRY_BEFORE = dtime(10, 30)  # the first hour backtests strongly negative
+# Entries are allowed from NO_NEW_ENTRY_BEFORE, measured on candle 2's CLOSE
+# time (the wall clock when the signal is evaluated), until NO_NEW_ENTRY_AFTER.
+# Moved 10:30 -> 10:00 on 2026-09-23 at the user's request, live from 2026-09-24.
+#
+# Swept on this config (breadth ADR >= 1.5, no slope, no VIX, 0.4%/0.1% trail,
+# lock 1.5R -> 0.5R), 2016-10..2026-09, 1 lot of 75, cost 3 pts a trade:
+#
+#     start   10y net    PF     2023+ net   PF     last 2y net   PF
+#     09:15    +83,389  1.04     +131,404  1.12       +119,201  1.18
+#     09:45   +230,671  1.13     +178,031  1.21       +157,129  1.32
+#     10:00   +308,132  1.21     +221,280  1.33       +232,346  1.63
+#     10:15   +348,920  1.28     +314,749  1.59       +292,354  2.01
+#     10:30   +322,447  1.29     +343,050  1.75       +287,160  2.10
+#     11:00   +148,100  1.16     +171,311  1.48       +224,014  2.13
+#
+# Split by the bucket each earlier start adds over 10 years: the 91 trades
+# entered 10:15-10:30 are worth +241 each, and the 146 entered 10:00-10:15
+# lose -244 each. 10:00 therefore buys back the good bucket and the bad one
+# together; 10:15 keeps only the good one. Told to the user 2026-09-23 with
+# 10:15 offered as the alternative - they asked for 10:00.
+NO_NEW_ENTRY_BEFORE = dtime(10, 0)
 NO_NEW_ENTRY_AFTER = dtime(14, 30)  # too close to square-off to be worth it
 SQUARE_OFF = dtime(15, 0)
 ABANDON_AFTER = dtime(15, 20)       # the exchange refuses MIS orders past 15:15
