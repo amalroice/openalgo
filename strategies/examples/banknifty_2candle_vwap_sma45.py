@@ -23,7 +23,9 @@ Entry (long; short is the mirror):
     1. Two consecutive candles lie completely above both VWAP and SMA(45) -
        each candle's low is above the higher of the two lines.
     2. The pair is the first of its run: the candle before candle 1 was not
-       itself completely above both lines.
+       itself completely above both lines. OFF on this copy since
+       2026-09-23 (FIRST_PAIR_ONLY = False), so any consecutive pair
+       inside a run can trigger. NIFTY still requires the first pair.
     3. Candle 2 closes above candle 1's HIGH (a short mirrors it: candle 2
        closes below candle 1's LOW). Clearing candle 1's whole range, not just
        its close, is what makes this a breakout.
@@ -193,6 +195,27 @@ TARGET_POLL_SECONDS = 5
 # trade at all - it only frees a slot on days that already traded twice.
 MAX_TRADES_PER_DAY = 3
 DIRECTIONS = ("long", "short")      # sides to trade
+
+# Must the qualifying pair be the FIRST of its run - the candle before candle 1
+# not already clear of both lines? False lets any consecutive pair inside a run
+# trigger, which is how the user restated the setup on 2026-09-23.
+#
+# Backtested that day on this config (11:00-14:30, max 3, stretch 0.4% while
+# VIX <= 14, 0.5%/0.1% trail, no lock), 1 lot of 30, cost 4 pts a trade:
+#
+#                  first pair only          any pair
+#     last 5y   +179,934 PF 1.24 DD -70,981   +254,170 PF 1.11 DD -99,090
+#     last 2y   +172,458 PF 1.61 DD -40,686   +189,313 PF 1.21 DD -91,587
+#     last 1y    +80,103 PF 1.51 Sh 1.43      +195,263 PF 1.54 Sh 2.31
+#     10y       +288,112 PF 1.19 DD -70,981   +511,010 PF 1.11 DD -150,614
+#
+# Any-pair earns more gross - 41% more over 5 years, 77% over 10 - at a lower
+# profit factor and roughly double the 10-year drawdown, and it swings harder
+# year to year (-48,846 in 2021, -45,404 in 2025, +185,841 in 2026). It beat
+# first-pair on every measure over the last year alone. The user chose it on
+# 2026-09-23 with those numbers in front of them. NIFTY keeps first-pair only,
+# where any-pair has no edge at all (PF 1.01-1.03 in every window).
+FIRST_PAIR_ONLY = False
 
 # Resting stop parked at the broker on entry, so a dead machine or a dropped
 # link cannot leave the option unprotected. The in-process trail above is still
@@ -787,8 +810,9 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
         if not (bool(first[flag]) and bool(second[flag])):
             continue
         # The run has to begin at candle 1, so the candle before it must not
-        # already have been clear of both lines.
-        if bool(before[flag]) and frame.index[-3].date() == today:
+        # already have been clear of both lines. Off since 2026-09-23,
+        # see FIRST_PAIR_ONLY.
+        if FIRST_PAIR_ONLY and bool(before[flag]) and frame.index[-3].date() == today:
             continue
         # Candle 2 must close clear of candle 1's RANGE, not merely its close:
         # above the high to buy a CE, below the low to buy a PE. Until
@@ -1626,6 +1650,8 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
+    log(f"pair rule: {'first pair of the run only' if FIRST_PAIR_ONLY else 'any qualifying pair'}; "
+        f"entries {NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY} a day")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)
