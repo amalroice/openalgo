@@ -93,8 +93,8 @@ from openalgo import api
 # NIFTY/BANKNIFTY copies run live, so a sandbox run is not available beside
 # them - this is the paper mode. Going live means DRY_RUN = False AND
 # I_UNDERSTAND_THIS_IS_LIVE = True, both edited by hand.
-I_UNDERSTAND_THIS_IS_LIVE = False   # must be True to run outside analyzer mode
-DRY_RUN = True                      # resolve and log, place nothing
+I_UNDERSTAND_THIS_IS_LIVE = True    # must be True to run outside analyzer mode
+DRY_RUN = False                     # resolve and log, place nothing; live from 2026-09-28
 
 STRATEGY_TAG = "SENSEX_2CANDLE_VWAP_SMA45"
 UNDERLYING = "SENSEX"
