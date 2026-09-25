@@ -260,6 +260,11 @@ FIRST_PAIR_VIX_MAX = 14.0
 BROKER_STOP = True                  # False reverts to the in-process stop alone
 BROKER_STOP_IV_POINTS = 2.0         # IV points of vega headroom
 BROKER_STOP_LIMIT_SLIP = 0.05       # limit sits this far below the trigger
+# The resting stop follows the in-process stop up (added 2026-09-25), keeping
+# the same theta and IV headroom, so it stays a disaster stop behind the
+# trail rather than a second, tighter one. Smaller raises are skipped: each
+# one is a cancel and a re-place at the broker.
+BROKER_STOP_MIN_RAISE = 0.5         # premium points
 TICK = 0.05                         # NFO option tick
 
 # Regime filter. On BANKNIFTY (six-bank volume) no VIX band beat taking every
@@ -1138,6 +1143,79 @@ def abandon_if_flat(client, state: dict) -> bool:
     return False
 
 
+MANUAL_EXIT_RECHECK_SECONDS = 2.0   # pause before trusting a flat position book
+
+
+def closed_outside(client, state: dict) -> bool:
+    """Reconcile the tracked position with the broker's position book.
+
+    Run every bar and before square-off. Without it, a position closed by hand
+    at the broker terminal goes unnoticed: on 2026-09-24 the NIFTY 23200 PE was
+    sold manually at 13:15 while this process kept trailing it until 15:00, the
+    resting stop stayed live as a SELL with nothing behind it (a naked short had
+    the premium touched the trigger), and the square-off SELL was rejected.
+
+    A flat book is read twice, MANUAL_EXIT_RECHECK_SECONDS apart, before it is
+    believed: acting on one bad read would cancel the stop on a live position and
+    stop managing it. A book that cannot be read changes nothing this bar.
+
+    A partial manual exit shrinks the tracked lots and re-places the resting stop
+    for what is left, at the trigger this process set, so it can never sell more
+    than is held. A net quantity ABOVE what this process bought is left alone -
+    exits here only ever sell the strategy's own lots.
+
+    Returns:
+        True when the position was found closed and local state was cleared.
+    """
+    if DRY_RUN:
+        return False
+    position = state.get("position")
+    if not position:
+        return False
+    expected = int(position["lotsize"]) * int(position["lots_open"])
+    qty = net_quantity(client, position["symbol"])
+    if qty is None or qty >= expected:
+        return False
+    if qty <= 0:
+        time.sleep(MANUAL_EXIT_RECHECK_SECONDS)
+        qty = net_quantity(client, position["symbol"])
+        if qty is None or qty > 0:
+            return False
+        if qty < 0:
+            log(f"broker reports {qty} {position['symbol']} - NET SHORT, not the "
+                f"long option this strategy bought. CHECK THE BROKER POSITION BY HAND")
+        log(f"{position['symbol']} was closed outside the strategy (manual exit?); "
+            f"broker holds {qty}, strategy expected {expected} - clearing it")
+        if BROKER_STOP:
+            drop_resting_stop(client, position, "the position was closed by hand")
+        state["position"] = None
+        return True
+
+    lotsize = int(position["lotsize"])
+    lots_left = qty // lotsize
+    log(f"{position['symbol']} partly closed outside the strategy: broker holds "
+        f"{qty} of {expected}; now managing {lots_left} lot(s)")
+    if BROKER_STOP and position.get("stop_order_id"):
+        drop_resting_stop(client, position, "resizing after a manual partial exit")
+        trigger = position.get("stop_trigger")
+        order_id = (place_broker_stop(client, position["symbol"], lots_left * lotsize,
+                                      float(trigger))
+                    if trigger and lots_left > 0 else None)
+        if order_id:
+            position["stop_order_id"] = order_id
+        else:
+            log("NO BROKER STOP after the resize. The rest is protected only while "
+                "this process is alive.")
+    if lots_left <= 0:
+        # Less than a lot left: nothing this process can sell in whole lots.
+        log(f"under one lot of {position['symbol']} remains; no longer managing "
+            f"it. CHECK THE BROKER POSITION BY HAND")
+        state["position"] = None
+        return True
+    position["lots_open"] = lots_left
+    return False
+
+
 # =============================================================================
 # BROKER-SIDE STOP
 # =============================================================================
@@ -1343,6 +1421,128 @@ def release_broker_stop(client, state: dict) -> str:
     return "blocked"
 
 
+def resting_stop_at_broker(client, symbol: str) -> str | None:
+    """Order id of a stop SELL already resting on this leg, if there is one.
+
+    Checked before a retry so an entry call that timed out AFTER the broker
+    took the order cannot lead to a second resting SELL: two stops on one lot
+    would open a naked short if both fired.
+
+    Returns:
+        The order id, or None when nothing rests or the book cannot be read.
+    """
+    try:
+        r = client.orderbook()
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"orderbook raised {exc!r}")
+        return None
+    if not ok(r):
+        log(f"orderbook failed: {r}")
+        return None
+    data = r.get("data") or {}
+    rows = data.get("orders") if isinstance(data, dict) else data
+    for row in rows or []:
+        status = str(row.get("order_status") or "").lower()
+        if (row.get("symbol") == symbol and row.get("exchange") == FO_EXCHANGE
+                and str(row.get("action") or "").upper() == "SELL"
+                and str(row.get("pricetype") or "").upper() in ("SL", "SL-M")
+                and ("trigger" in status or status == "open")):
+            return str(row.get("orderid"))
+    return None
+
+
+def retry_broker_stop(client, position: dict, spot: float) -> None:
+    """Park the resting stop on a position that is still without one.
+
+    The entry attempt can fail on a Greeks timeout or a broker reject, and
+    before this retry the trade then ran to the end with no stop at the
+    broker. It is sized off the current index price and the current stop, so
+    it protects what the trade holds now rather than what it held at entry.
+    """
+    symbol = position["symbol"]
+    existing = resting_stop_at_broker(client, symbol)
+    if existing:
+        position["stop_order_id"] = existing
+        log(f"found resting stop {existing} on {symbol}; adopting it")
+        return
+    stop = float(position["stop"])
+    long = position["direction"] == "long"
+    if (spot <= stop) if long else (spot >= stop):
+        return
+    quantity = int(position["lotsize"]) * int(position["lots_open"])
+    trigger = option_stop_price(client, symbol, spot, stop)
+    order_id = (place_broker_stop(client, symbol, quantity, trigger)
+                if trigger is not None else None)
+    if order_id:
+        position["stop_order_id"] = order_id
+        position["stop_trigger"] = trigger
+        position["broker_basis"] = stop
+        log(f"broker stop parked on retry for {symbol}")
+    else:
+        log("STILL NO BROKER STOP on this position; retrying next bar")
+
+
+def ratchet_broker_stop(client, state: dict, spot: float) -> dict:
+    """Raise the resting stop behind the in-process stop; never lower it.
+
+    Runs when the trail, lock or breakeven has tightened the index stop past
+    the level the resting stop was sized from. The new trigger comes from the
+    same Greeks mapping as the entry stop, headroom included, and replaces the
+    old one only when it is at least BROKER_STOP_MIN_RAISE higher.
+
+    Cancel and re-place rather than modify: those are the two calls proven live
+    on Angel, and OpenAlgo's Angel modify mapping did not carry the trigger
+    until 2026-09-25. The cancel goes through release_broker_stop, so a stop
+    that may be filling is never doubled. If the raised stop is refused, the
+    old level is put back; if that fails too, retry_broker_stop re-parks one
+    on the next bar.
+
+    Returns:
+        The updated state dict; its position is None when the stop had filled.
+    """
+    position = state["position"]
+    symbol = position["symbol"]
+    long = position["direction"] == "long"
+    stop = float(position["stop"])
+    basis = position.get("broker_basis")
+    if basis is not None and ((stop <= float(basis)) if long else (stop >= float(basis))):
+        return state
+    if (spot <= stop) if long else (spot >= stop):
+        return state
+    old = position.get("stop_trigger")
+    trigger = option_stop_price(client, symbol, spot, stop)
+    if trigger is None:
+        return state
+    if old is not None and trigger < float(old) + BROKER_STOP_MIN_RAISE:
+        log(f"broker stop stays at {float(old):.2f}; the level for index stop "
+            f"{stop:.2f} is {trigger:.2f}, under {BROKER_STOP_MIN_RAISE} higher")
+        return state
+
+    outcome = release_broker_stop(client, state)
+    if outcome != "clear":
+        # 'filled': the stop closed the position. 'blocked': the old stop is
+        # still resting and still protects; the raise waits a bar.
+        return state
+
+    quantity = int(position["lotsize"]) * int(position["lots_open"])
+    order_id = place_broker_stop(client, symbol, quantity, trigger)
+    if order_id:
+        position["stop_order_id"] = order_id
+        position["stop_trigger"] = trigger
+        position["broker_basis"] = stop
+        shown = f"{float(old):.2f}" if old is not None else "none"
+        log(f"broker stop raised {shown} -> {trigger:.2f} behind index stop {stop:.2f}")
+        return state
+    if old is not None:
+        log(f"raised stop refused; putting back the previous trigger {float(old):.2f}")
+        order_id = place_broker_stop(client, symbol, quantity, float(old))
+        if order_id:
+            position["stop_order_id"] = order_id
+            return state
+    log("NO BROKER STOP after the raise; it is re-parked on the next bar")
+    return state
+
+
 def stop_fired(client, state: dict) -> bool:
     """True when the resting stop closed the position while we were away."""
     position = state.get("position") or {}
@@ -1435,6 +1635,11 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
     if BROKER_STOP and stop_fired(client, state):
         return state
 
+    # Or it may have been closed by hand at the broker terminal.
+    if closed_outside(client, state):
+        return state
+    position = state["position"]
+
     bar = frame.iloc[-1]
     long = position["direction"] == "long"
     stop = float(position["stop"])
@@ -1473,7 +1678,14 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             position["stop"] = moved
             log(f"trail: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
 
+    # A stop that failed to park at entry is retried every bar until it rests;
+    # one that is resting is raised behind the in-process stop.
     state["position"] = position
+    if BROKER_STOP and not DRY_RUN:
+        if not position.get("stop_order_id"):
+            retry_broker_stop(client, position, float(bar["close"]))
+        else:
+            state = ratchet_broker_stop(client, state, float(bar["close"]))
     return state
 
 
@@ -1486,6 +1698,9 @@ def square_off(client, state: dict) -> dict:
     position = state.get("position")
     if not position:
         return state
+    if closed_outside(client, state):
+        return state
+    position = state["position"]
     if BROKER_STOP:
         outcome = release_broker_stop(client, state)
         if outcome == "filled":
@@ -1625,6 +1840,7 @@ def cycle(client, state: dict) -> dict:
         if order_id:
             state["position"]["stop_order_id"] = order_id
             state["position"]["stop_trigger"] = trigger
+            state["position"]["broker_basis"] = stop
         else:
             log("NO BROKER STOP on this position. It is protected only while "
                 "this process is alive.")
