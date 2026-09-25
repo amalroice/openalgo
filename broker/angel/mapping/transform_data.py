@@ -48,6 +48,7 @@ def transform_modify_order_data(data, token):
         "exchange": data["exchange"],
         "disclosedquantity": data.get("disclosed_quantity", "0"),
         "stoploss": data.get("trigger_price", "0"),
+        "triggerprice": data.get("trigger_price", "0"),
     }
 
 
