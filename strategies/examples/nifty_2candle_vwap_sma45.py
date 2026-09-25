@@ -62,6 +62,8 @@ Management (2 lots):
     target     OFF (TARGET_R = None). When set, the whole position is sold
                the moment the index trades TARGET_R times R past the entry, R
                being the entry less candle 1's low. Backtests badly; see there.
+    step stop  ON since 2026-09-25: every STEP_TRAIL_PTS the index gains, the
+               stop moves STEP_TRAIL_MOVE_PTS (half) from where it started.
     close stop OFF (CLOSE_STOP = False). When on, a candle that CLOSES below
                candle 1's low (short: above its high) exits.
     trail      the stop sits TRAIL_DIST_PCT of the entry behind the best
@@ -193,6 +195,30 @@ TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
 TARGET_R = None                     # 1.5 books the whole position at 1.5R; off, see below
 CLOSE_STOP = False                  # True exits on a close beyond candle 1; off, see below
 TARGET_POLL_SECONDS = 5
+
+# Step stop: every STEP_TRAIL_PTS the index moves in the trade's favour (best
+# high or low of a closed bar), the stop moves STEP_TRAIL_MOVE_PTS from its
+# starting level - half the step. Like the trail it only ever tightens, is
+# checked against the next bar, and the resting broker stop follows it.
+#
+# Added 2026-09-25 by the user's decision. The same evening it ran briefly as a
+# full step (stop moves the whole step) with TARGET_R = 1.5, then was switched
+# to the half step with the target off after this replay of the live config
+# (1 lot, cost per trade as elsewhere, data to 2026-09-18, target filled AT its
+# price, which flatters it). The target does the damage; with it off, the half
+# step keeps nearly all of the earlier result:
+#
+#                             10y          last 2y            last 1y          last 3m
+#     before (BE +40)      +2,83,345   +2,33,903 PF 2.03   +1,25,340 PF 2.31   +17,748
+#     full step + target      -9,249   +1,08,503 PF 1.51     +69,524 PF 1.76    -1,765
+#     half step + target     -24,004   +1,04,567 PF 1.48     +69,657 PF 1.74      +491
+#     half step (live)     +2,54,466   +2,07,961 PF 1.90   +1,04,124 PF 2.01   +17,540
+#     full step            +2,27,749   +2,01,558 PF 1.92   +1,07,851 PF 2.12   +10,130
+#
+# Set STEP_TRAIL_PTS = None to restore the earlier exits.
+# Reproduce: session 6c4a1f40 scratchpad half_step.py.
+STEP_TRAIL_PTS = 20.0
+STEP_TRAIL_MOVE_PTS = 10.0
 
 # SWITCHED OFF the same evening, 2026-09-21, after a two-year replay
 # (2024-09-11..2026-09-18, net index points per lot, target filled AT its price,
@@ -1771,6 +1797,19 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             log(f"breakeven: best +{position['mfe']:.2f} pts clears "
                 f"{BREAKEVEN_AT_PTS:.0f}, stop {stop:.2f} -> {moved:.2f} (entry)")
 
+    # Step stop, applied last so it only ever tightens: STEP_TRAIL_MOVE_PTS of
+    # stop for every STEP_TRAIL_PTS of best move, counted from the starting stop.
+    stop0 = position.get("stop0")
+    if STEP_TRAIL_PTS is not None and stop0 is not None and position["mfe"] >= STEP_TRAIL_PTS:
+        steps = int(position["mfe"] // STEP_TRAIL_PTS)
+        level = float(stop0) + (1 if long else -1) * steps * STEP_TRAIL_MOVE_PTS
+        current = float(position["stop"])
+        moved = max(current, level) if long else min(current, level)
+        if moved != current:
+            position["stop"] = moved
+            log(f"step: best +{position['mfe']:.2f} pts is {steps} x {STEP_TRAIL_PTS:.0f}, "
+                f"stop {current:.2f} -> {moved:.2f} ({STEP_TRAIL_MOVE_PTS:.0f} a step)")
+
     # A stop that failed to park at entry is retried every bar until it rests;
     # one that is resting is raised behind the in-process stop.
     state["position"] = position
@@ -1906,7 +1945,7 @@ def cycle(client, state: dict) -> dict:
     state["position"] = {
         "direction": sig["direction"], "symbol": leg["symbol"],
         "lotsize": leg["lotsize"], "lots_open": LOTS,
-        "entry": spot, "stop": stop, "risk": risk,
+        "entry": spot, "stop": stop, "stop0": stop, "risk": risk,
         "mfe": 0.0, "opened": now.isoformat(),
         "c1_low": sig["c1_low"], "c1_high": sig["c1_high"], "target": None,
     }
