@@ -224,10 +224,13 @@ def fetch_today(client, retries: int = 3) -> pd.DataFrame:
     cutoff = datetime.now(IST) - timedelta(seconds=BAR_SECONDS)
     frame = frame[frame.index <= cutoff]
     # Angel occasionally emits a junk bar whose range dwarfs the rest; one
-    # such bar would swallow every cluster after it.
+    # such bar would swallow every cluster after it. The opening bar is exempt:
+    # a gap or opening rush is genuinely wide, and once the midday bars go quiet
+    # it would otherwise clear 10x the median and be thrown away.
     if len(frame) >= 5:
         span = frame["high"] - frame["low"]
-        absurd = span > 10.0 * span.median()
+        opening = frame.index.time == SESSION_OPEN
+        absurd = (span > 10.0 * span.median()) & ~opening
         for stamp in frame.index[absurd]:
             log(f"dropping implausible bar {stamp:%H:%M}: range {float(span[stamp]):.2f}")
         frame = frame[~absurd]
