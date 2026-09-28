@@ -26,10 +26,15 @@ Active-day filter (added 2026-09-27), read when a signal fires:
     qualifies too. It is a "decisive day" test, not a trend-direction test.
     An unreadable VIX or breadth skips the signal.
 
-Two paper books run side by side on the same bars, each with its own
+Three paper books run side by side on the same bars, each with its own
 position, trade count and cluster restart, exactly as the backtest runs them:
     filtered   the rule above WITH the active-day filter (the candidate)
+    vix14      the same filter with the VIX floor at 14 (added 2026-09-28)
     plain      the rule above WITHOUT it (the comparison)
+
+vix14 exists to settle 13 vs 14 on live fills. Over 10y the 13-14 band nets
+only ~15 pts a trade after the 10 pt cost (297 trades, PF 1.22): if real stop
+slippage there runs past ~25 pts, vix14 is the better rule.
 
 Backtest, SENSEX 5m 2016-10..2026-09-25, stops filled AT the stop price, index
 points per trade. The filter was chosen on 2016-10..2022-12 only and checked
@@ -92,8 +97,10 @@ COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 # of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau.
 VIX_MIN = 13.0
 BREADTH_MIN = 2.0
+# VIX floor per gated book; every book not listed here is ungated.
+BOOK_VIX_MIN = {"filtered": VIX_MIN, "vix14": 14.0}
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
-BOOKS = ("filtered", "plain")
+BOOKS = ("filtered", "vix14", "plain")
 
 SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(9, 30)
@@ -403,8 +410,9 @@ def read_breadth(client) -> tuple[int, int] | None:
     return advancers, decliners
 
 
-def active_day(vix: float | None, breadth: tuple[int, int] | None) -> tuple[bool, str]:
-    """The filtered book's gate, as backtested.
+def active_day(vix: float | None, breadth: tuple[int, int] | None,
+               vix_min: float = VIX_MIN) -> tuple[bool, str]:
+    """A gated book's filter, as backtested.
 
     Returns:
         (passes, a reading to log).
@@ -415,8 +423,8 @@ def active_day(vix: float | None, breadth: tuple[int, int] | None) -> tuple[bool
         return False, f"VIX {vix:.2f}, breadth unreadable"
     adv, dec = breadth
     ratio = max(adv, dec) / max(min(adv, dec), 1)
-    reading = f"VIX {vix:.2f} (needs > {VIX_MIN:g}), NIFTY 50 {adv} up / {dec} down = {ratio:.2f}x (needs {BREADTH_MIN:g}x)"
-    return vix > VIX_MIN and ratio >= BREADTH_MIN, reading
+    reading = f"VIX {vix:.2f} (needs > {vix_min:g}), NIFTY 50 {adv} up / {dec} down = {ratio:.2f}x (needs {BREADTH_MIN:g}x)"
+    return vix > vix_min and ratio >= BREADTH_MIN, reading
 
 
 # =============================================================================
@@ -445,9 +453,11 @@ def save_state(state: dict) -> None:
 
 def fresh_day(state: dict, today: str) -> dict:
     if state.get("date") != today or "books" not in state:
-        state = {"date": today, "books": {
-            name: {"trades": 0, "position": None, "cluster_from": None, "closed": []}
-            for name in BOOKS}}
+        state = {"date": today, "books": {}}
+    # A book added mid-day (restart after an upgrade) joins with a clean slate.
+    for name in BOOKS:
+        state["books"].setdefault(
+            name, {"trades": 0, "position": None, "cluster_from": None, "closed": []})
     return state
 
 
@@ -573,8 +583,8 @@ def cycle(client, state: dict) -> dict:
     for name, book in books.items():
         manage(client, name, book, frame)
 
-    # Shared per cycle, so both books see the same quotes.
-    gate_reading: dict = {}
+    # Shared per cycle, so every book sees the same quotes.
+    gate_quotes: dict = {}
     legs: dict = {}
     parts = []
     for name, book in books.items():
@@ -596,10 +606,10 @@ def cycle(client, state: dict) -> dict:
         if book.get("trades", 0) >= MAX_TRADES_PER_DAY:
             log(f"[{name}] {side} breakout skipped: {MAX_TRADES_PER_DAY} trades already today")
             continue
-        if name == "filtered":
-            if not gate_reading:
-                gate_reading["v"] = active_day(read_vix(client), read_breadth(client))
-            passes, reading = gate_reading["v"]
+        if name in BOOK_VIX_MIN:
+            if not gate_quotes:
+                gate_quotes["v"] = (read_vix(client), read_breadth(client))
+            passes, reading = active_day(*gate_quotes["v"], BOOK_VIX_MIN[name])
             if not passes:
                 log(f"[{name}] {side} breakout skipped, not an active day: {reading}")
                 continue
@@ -673,8 +683,8 @@ def main() -> int:
         f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, entries "
         f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY}, "
         f"square-off {SQUARE_OFF:%H:%M}")
-    log(f"books: filtered (VIX > {VIX_MIN:g} and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x) "
-        f"and plain (no filter)")
+    log(f"books: filtered (VIX > {VIX_MIN:g} and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x), "
+        f"vix14 (same with VIX > {BOOK_VIX_MIN['vix14']:g}) and plain (no filter)")
 
     state = load_state()
     try:
