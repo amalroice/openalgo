@@ -16,8 +16,9 @@ Rule (long; short is the mirror):
     4. Stop: the opposite side of the box.
     5. Trail: the stop sits TRAIL_DIST_PCT of the entry behind the best price,
        moved in TRAIL_STEP_PCT steps, never looser than the box stop.
-       Breakeven: once the best move reaches BREAKEVEN_AT_PTS (120) index
-       points, the stop is never worse than the entry (added 2026-09-29).
+       Breakeven: OFF (BREAKEVEN_AT_PTS = None). When set, once the best
+       move reaches that many index points the stop is never worse than the
+       entry. Every level from 40 to 160 lost points over 10y.
     6. Square-off at SQUARE_OFF. Entries NO_NEW_ENTRY_BEFORE..NO_NEW_ENTRY_AFTER,
        at most MAX_TRADES_PER_DAY, one position at a time. After an exit a new
        cluster may only start on the bar after the exit bar.
@@ -97,7 +98,7 @@ BOX_PCT = 0.0025                    # box height as a fraction of price (0.25%)
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
 MAX_TRADES_PER_DAY = 2
-BREAKEVEN_AT_PTS = 120.0            # stop to entry once the best move reaches this; None = off
+BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points at every level tested
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
 # Active-day filter for the "filtered" book. VIX_MIN sits on the 13-14 plateau
@@ -717,9 +718,11 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     client = build_client()
+    be_text = (f"breakeven at +{BREAKEVEN_AT_PTS:g} pts" if BREAKEVEN_AT_PTS is not None
+               else "breakeven off")
     log(f"{STRATEGY_TAG} starting, PAPER ONLY - no order is ever sent: "
         f">= {MIN_CANDLES} candles in a {BOX_PCT:.2%} box, stop at the far side, "
-        f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, breakeven at +{BREAKEVEN_AT_PTS} pts, entries "
+        f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, {be_text}, entries "
         f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY}, "
         f"square-off {SQUARE_OFF:%H:%M}")
     breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
