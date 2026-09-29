@@ -35,10 +35,21 @@ Active-day filter (added 2026-09-27), read when a signal fires:
     (41,258 vs 42,044 pts) from 853 more trades, with maxDD -3,863 vs -2,029
     and OOS PF 1.28 vs 1.45.
 
-Two paper books run side by side on the same bars, each with its own
+Three paper books run side by side on the same bars, each with its own
 position, trade count and cluster restart, exactly as the backtest runs them:
     filtered   the rule above WITH the active-day filter (the candidate)
+    boxatr     filtered, and the box is at most BOX_ATR_MAX (2) x ATR(14) of
+               the 5m bars at the signal bar (added 2026-09-29)
     plain      the rule above WITHOUT it (the comparison)
+
+boxatr skips breakouts from boxes that are wide for the current volatility.
+Over 2016-10..2026-09-25 against filtered: 1,324 vs 1,768 trades, net 36,297
+vs 42,044, PF 1.39 vs 1.35, OOS PF 1.50 vs 1.45 (1.37 vs 1.32 at a 20 pt
+cost), maxDD -2,330 vs -2,029, 11/11 years. Every cap from 1.75 to 3.0 gave
+PF 1.36-1.39, so 2.0 is not a spike. It is here to see whether fewer, better
+trades win once real stop slippage is paid. ATR is Wilder's (EWM alpha 1/14)
+over the true range, carried across days, warmed on ATR_WARMUP_DAYS prior
+sessions fetched once a day, as the backtest computes it.
 
 A vix14 book (same filter, VIX floor 14) ran 2026-09-28..29 and was dropped at
 the user's call: the VIX floor is 13 only.
@@ -107,9 +118,13 @@ COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 VIX_MIN = 13.0
 BREADTH_MIN = 2.0
 # VIX floor per gated book; every book not listed here is ungated.
-BOOK_VIX_MIN = {"filtered": VIX_MIN}
+BOOK_VIX_MIN = {"filtered": VIX_MIN, "boxatr": VIX_MIN}
+# Box height cap in ATR(14) multiples, per book; books not listed have none.
+BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
+ATR_PERIOD = 14
+ATR_WARMUP_DAYS = 10                # calendar days of prior bars for the ATR
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
-BOOKS = ("filtered", "plain")
+BOOKS = ("filtered", "boxatr", "plain")
 ITM_POINTS = 100                    # paper strike this far in the money; was ATM until 2026-09-29
 
 SESSION_OPEN = dtime(9, 15)
@@ -142,6 +157,7 @@ BREADTH_CONSTITUENTS = [
 ]
 
 _shutdown = False
+_prior_bars: dict = {}              # {"date": today, "frame": prior sessions' bars}
 
 
 # =============================================================================
@@ -252,6 +268,47 @@ def fetch_today(client, retries: int = 3) -> pd.DataFrame:
             log(f"dropping implausible bar {stamp:%H:%M}: range {float(span[stamp]):.2f}")
         frame = frame[~absurd]
     return frame
+
+
+def fetch_prior(client) -> pd.DataFrame | None:
+    """Completed 5m bars of the sessions before today, fetched once a day.
+
+    Returns:
+        Bars from ATR_WARMUP_DAYS calendar days back to yesterday, or None
+        when the fetch fails (retried on the next call).
+    """
+    today = datetime.now(IST).date()
+    if _prior_bars.get("date") == today:
+        return _prior_bars["frame"]
+    try:
+        frame = client.history(symbol=UNDERLYING, exchange=INDEX_EXCHANGE, interval=INTERVAL,
+                               start_date=str(today - timedelta(days=ATR_WARMUP_DAYS)),
+                               end_date=str(today - timedelta(days=1)))
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"prior bars raised {exc!r}")
+        return None
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        log(f"prior bars unavailable: {frame if not isinstance(frame, pd.DataFrame) else 'empty'}")
+        return None
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+    frame = frame.tz_localize(IST) if frame.index.tz is None else frame.tz_convert(IST)
+    frame = frame[(frame.index.date < today) & (frame.index.time >= SESSION_OPEN)
+                  & (frame.index.time <= dtime(15, 25))]
+    _prior_bars.update(date=today, frame=frame)
+    log(f"cached {len(frame)} prior bars over {len(set(frame.index.date))} sessions for the ATR")
+    return frame
+
+
+def atr_now(prior: pd.DataFrame, frame: pd.DataFrame) -> float | None:
+    """Wilder ATR(ATR_PERIOD) at the last completed bar, across days."""
+    bars = pd.concat([prior, frame]).sort_index()
+    bars = bars[~bars.index.duplicated(keep="last")]
+    if len(bars) < 3 * ATR_PERIOD:
+        return None
+    prev = bars["close"].shift(1)
+    tr = pd.concat([bars["high"] - bars["low"], (bars["high"] - prev).abs(),
+                    (bars["low"] - prev).abs()], axis=1).max(axis=1)
+    return float(tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean().iloc[-1])
 
 
 def index_ltp(client) -> float | None:
@@ -654,6 +711,21 @@ def cycle(client, state: dict) -> dict:
                 log(f"[{name}] {side} breakout skipped, not an active day: {reading}")
                 continue
             log(f"[{name}] active day: {reading}")
+        if name in BOOK_BOX_ATR_MAX:
+            if "atr" not in gate_quotes:
+                prior = fetch_prior(client)
+                gate_quotes["atr"] = atr_now(prior, frame) if prior is not None else None
+            atr = gate_quotes["atr"]
+            box = sig["high"] - sig["low"]
+            cap = BOOK_BOX_ATR_MAX[name]
+            if atr is None:
+                log(f"[{name}] {side} breakout skipped: ATR unreadable")
+                continue
+            if box > cap * atr:
+                log(f"[{name}] {side} breakout skipped: box {box:.2f} pts is "
+                    f"{box / atr:.2f}x ATR {atr:.2f}, cap {cap:g}x")
+                continue
+            log(f"[{name}] box {box:.2f} pts is {box / atr:.2f}x ATR {atr:.2f}, within {cap:g}x")
 
         long = side == "long"
         if "spot" not in legs:
@@ -727,7 +799,8 @@ def main() -> int:
         f"square-off {SQUARE_OFF:%H:%M}")
     breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
                     if BREADTH_MIN is not None else ", breadth filter off")
-    log(f"books: filtered (VIX > {VIX_MIN:g}{breadth_rule}) and plain (no filter); "
+    log(f"books: filtered (VIX > {VIX_MIN:g}{breadth_rule}), boxatr (filtered and box <= "
+        f"{BOOK_BOX_ATR_MAX['boxatr']:g}x ATR{ATR_PERIOD}) and plain (no filter); "
         f"option {ITM_POINTS} pts ITM")
 
     state = load_state()
