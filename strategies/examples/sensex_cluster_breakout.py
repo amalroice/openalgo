@@ -27,20 +27,18 @@ Active-day filter (added 2026-09-27), read when a signal fires:
     qualifies too. It is a "decisive day" test, not a trend-direction test.
     An unreadable VIX or breadth skips the signal.
 
-    BREADTH PART OFF since 2026-09-29 (BREADTH_MIN = None), at the user's
-    call: the gated books now need only VIX above their floor. The backtest
-    table below is for VIX AND breadth, so it no longer describes these
-    books exactly.
+    Breadth was switched off for part of 2026-09-29 and back on the same
+    evening: over 2016-10..2026-09-25 VIX > 13 alone netted about the same
+    (41,258 vs 42,044 pts) from 853 more trades, with maxDD -3,863 vs -2,029
+    and OOS PF 1.28 vs 1.45.
 
-Three paper books run side by side on the same bars, each with its own
+Two paper books run side by side on the same bars, each with its own
 position, trade count and cluster restart, exactly as the backtest runs them:
     filtered   the rule above WITH the active-day filter (the candidate)
-    vix14      the same filter with the VIX floor at 14 (added 2026-09-28)
     plain      the rule above WITHOUT it (the comparison)
 
-vix14 exists to settle 13 vs 14 on live fills. Over 10y the 13-14 band nets
-only ~15 pts a trade after the 10 pt cost (297 trades, PF 1.22): if real stop
-slippage there runs past ~25 pts, vix14 is the better rule.
+A vix14 book (same filter, VIX floor 14) ran 2026-09-28..29 and was dropped at
+the user's call: the VIX floor is 13 only.
 
 Backtest, SENSEX 5m 2016-10..2026-09-25, stops filled AT the stop price, index
 points per trade. The filter was chosen on 2016-10..2022-12 only and checked
@@ -100,14 +98,14 @@ MAX_TRADES_PER_DAY = 2
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
 # Active-day filter for the "filtered" book. VIX_MIN sits on the 13-14 plateau
-# of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau. BREADTH_MIN was
-# 2.0 until 2026-09-29; None switches the breadth part off, VIX alone gates.
+# of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau. None switches
+# the breadth part off so VIX alone gates (tried 2026-09-29, backtests worse).
 VIX_MIN = 13.0
-BREADTH_MIN = None
+BREADTH_MIN = 2.0
 # VIX floor per gated book; every book not listed here is ungated.
-BOOK_VIX_MIN = {"filtered": VIX_MIN, "vix14": 14.0}
+BOOK_VIX_MIN = {"filtered": VIX_MIN}
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
-BOOKS = ("filtered", "vix14", "plain")
+BOOKS = ("filtered", "plain")
 ITM_POINTS = 100                    # paper strike this far in the money; was ATM until 2026-09-29
 
 SESSION_OPEN = dtime(9, 15)
@@ -717,8 +715,7 @@ def main() -> int:
         f"square-off {SQUARE_OFF:%H:%M}")
     breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
                     if BREADTH_MIN is not None else ", breadth filter off")
-    log(f"books: filtered (VIX > {VIX_MIN:g}{breadth_rule}), "
-        f"vix14 (same with VIX > {BOOK_VIX_MIN['vix14']:g}) and plain (no filter); "
+    log(f"books: filtered (VIX > {VIX_MIN:g}{breadth_rule}) and plain (no filter); "
         f"option {ITM_POINTS} pts ITM")
 
     state = load_state()
