@@ -2,7 +2,8 @@
 
 This script never places an order: there is no order call anywhere in it. It
 reads SENSEX spot (BSE_INDEX), finds the signals, and logs a paper record with
-the ATM weekly BFO option's real premium at entry and exit.
+the real premium of the weekly BFO option ITM_POINTS (100) in the money - CE
+below ATM, PE above; ATM until 2026-09-29 - at entry and exit.
 
 Rule (long; short is the mirror):
     1. Cluster: at least MIN_CANDLES consecutive completed candles that all fit
@@ -25,6 +26,11 @@ Active-day filter (added 2026-09-27), read when a signal fires:
     advancers, in EITHER direction - a short breakout on a strongly up day
     qualifies too. It is a "decisive day" test, not a trend-direction test.
     An unreadable VIX or breadth skips the signal.
+
+    BREADTH PART OFF since 2026-09-29 (BREADTH_MIN = None), at the user's
+    call: the gated books now need only VIX above their floor. The backtest
+    table below is for VIX AND breadth, so it no longer describes these
+    books exactly.
 
 Three paper books run side by side on the same bars, each with its own
 position, trade count and cluster restart, exactly as the backtest runs them:
@@ -94,13 +100,15 @@ MAX_TRADES_PER_DAY = 2
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
 # Active-day filter for the "filtered" book. VIX_MIN sits on the 13-14 plateau
-# of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau.
+# of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau. BREADTH_MIN was
+# 2.0 until 2026-09-29; None switches the breadth part off, VIX alone gates.
 VIX_MIN = 13.0
-BREADTH_MIN = 2.0
+BREADTH_MIN = None
 # VIX floor per gated book; every book not listed here is ungated.
 BOOK_VIX_MIN = {"filtered": VIX_MIN, "vix14": 14.0}
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
 BOOKS = ("filtered", "vix14", "plain")
+ITM_POINTS = 100                    # paper strike this far in the money; was ATM until 2026-09-29
 
 SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(9, 30)
@@ -292,8 +300,14 @@ def nearest_weekly(client) -> str | None:
     return None
 
 
-def resolve_atm(client, option_type: str) -> dict | None:
-    """ATM option of the nearest weekly expiry after today."""
+def resolve_leg(client, option_type: str) -> dict | None:
+    """Option ITM_POINTS in the money, nearest weekly expiry after today.
+
+    ATM (listed strike nearest spot) comes from optionsymbol; the strike then
+    moves ITM_POINTS into the money, down for a CE and up for a PE. Points, not
+    an ITMn offset, because ITMn counts listed strikes. The target contract
+    must be listed, or the paper leg is left unresolved.
+    """
     expiry = nearest_weekly(client)
     if not expiry:
         return None
@@ -302,7 +316,22 @@ def resolve_atm(client, option_type: str) -> dict | None:
     if not ok(r):
         log(f"optionsymbol {option_type} failed: {r}")
         return None
-    return {"symbol": r["symbol"], "lotsize": int(r["lotsize"])}
+    prefix = f"{UNDERLYING}{expiry}"
+    atm_symbol = r["symbol"]
+    try:
+        atm = float(atm_symbol[len(prefix):-2])
+    except ValueError:
+        log(f"cannot read the strike from {atm_symbol}")
+        return None
+    strike = atm - ITM_POINTS if option_type == "CE" else atm + ITM_POINTS
+    symbol = f"{prefix}{strike:g}{option_type}"
+    s = client.symbol(symbol=symbol, exchange=FO_EXCHANGE)
+    if not ok(s):
+        log(f"{symbol} ({ITM_POINTS} pts ITM of {atm_symbol}) is not listed: {s}")
+        return None
+    log(f"strike {strike:g}: ATM {atm:g} (spot {r.get('underlying_ltp')}) "
+        f"moved {ITM_POINTS} pts ITM")
+    return {"symbol": symbol, "lotsize": int(r["lotsize"])}
 
 
 # =============================================================================
@@ -419,6 +448,8 @@ def active_day(vix: float | None, breadth: tuple[int, int] | None,
     """
     if vix is None:
         return False, "VIX unreadable"
+    if BREADTH_MIN is None:
+        return vix > vix_min, f"VIX {vix:.2f} (needs > {vix_min:g}), breadth filter off"
     if breadth is None:
         return False, f"VIX {vix:.2f}, breadth unreadable"
     adv, dec = breadth
@@ -608,7 +639,8 @@ def cycle(client, state: dict) -> dict:
             continue
         if name in BOOK_VIX_MIN:
             if not gate_quotes:
-                gate_quotes["v"] = (read_vix(client), read_breadth(client))
+                breadth = read_breadth(client) if BREADTH_MIN is not None else None
+                gate_quotes["v"] = (read_vix(client), breadth)
             passes, reading = active_day(*gate_quotes["v"], BOOK_VIX_MIN[name])
             if not passes:
                 log(f"[{name}] {side} breakout skipped, not an active day: {reading}")
@@ -626,7 +658,7 @@ def cycle(client, state: dict) -> dict:
             continue
         opt_type = "CE" if long else "PE"
         if opt_type not in legs:
-            leg = resolve_atm(client, opt_type)
+            leg = resolve_leg(client, opt_type)
             legs[opt_type] = (leg, option_ltp(client, leg["symbol"]) if leg else None)
         leg, premium = legs[opt_type]
         shown = f"{premium:.2f}" if premium is not None else "unknown"
@@ -683,8 +715,11 @@ def main() -> int:
         f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, entries "
         f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY}, "
         f"square-off {SQUARE_OFF:%H:%M}")
-    log(f"books: filtered (VIX > {VIX_MIN:g} and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x), "
-        f"vix14 (same with VIX > {BOOK_VIX_MIN['vix14']:g}) and plain (no filter)")
+    breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
+                    if BREADTH_MIN is not None else ", breadth filter off")
+    log(f"books: filtered (VIX > {VIX_MIN:g}{breadth_rule}), "
+        f"vix14 (same with VIX > {BOOK_VIX_MIN['vix14']:g}) and plain (no filter); "
+        f"option {ITM_POINTS} pts ITM")
 
     state = load_state()
     try:
