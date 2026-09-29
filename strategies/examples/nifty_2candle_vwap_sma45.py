@@ -62,8 +62,9 @@ Management (1 lot):
     target     OFF (TARGET_R = None). When set, the whole position is sold
                the moment the index trades TARGET_R times R past the entry, R
                being the entry less candle 1's low. Backtests badly; see there.
-    step stop  ON since 2026-09-25: every STEP_TRAIL_PTS the index gains, the
-               stop moves STEP_TRAIL_MOVE_PTS (half) from where it started.
+    step stop  OFF since 2026-09-29 (STEP_TRAIL_PTS = None; on 09-25..29).
+               When on, every STEP_TRAIL_PTS the index gains, the stop moves
+               STEP_TRAIL_MOVE_PTS (half) from where it started.
     close stop OFF (CLOSE_STOP = False). When on, a candle that CLOSES below
                candle 1's low (short: above its high) exits.
     trail      the stop sits TRAIL_DIST_PCT of the entry behind the best
@@ -218,7 +219,16 @@ TARGET_POLL_SECONDS = 5
 #
 # Set STEP_TRAIL_PTS = None to restore the earlier exits.
 # Reproduce: session 6c4a1f40 scratchpad half_step.py.
-STEP_TRAIL_PTS = 20.0
+#
+# SWITCHED OFF 2026-09-29 at the user's call, keeping breakeven +40 and the
+# lock. Replay of the live config, data to 2026-09-25, 1 lot of 65, Rs net:
+#
+#                        10y        last 2y            last 1y     2026 YTD   maxDD
+#     with half step   +2,61,479   +2,22,118 PF 1.98   +1,08,521    +74k    -84,516
+#     without          +2,90,359   +2,48,700 PF 2.12   +1,29,737    +88k    -92,807
+#
+# Reproduce: session 9bf6fcc5 scratchpad nifty_exit.py / nifty_exit_combo.py.
+STEP_TRAIL_PTS = None                # was 20.0 (2026-09-25..29)
 STEP_TRAIL_MOVE_PTS = 10.0
 
 # SWITCHED OFF the same evening, 2026-09-21, after a two-year replay
