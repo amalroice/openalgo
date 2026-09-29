@@ -16,6 +16,8 @@ Rule (long; short is the mirror):
     4. Stop: the opposite side of the box.
     5. Trail: the stop sits TRAIL_DIST_PCT of the entry behind the best price,
        moved in TRAIL_STEP_PCT steps, never looser than the box stop.
+       Breakeven: once the best move reaches BREAKEVEN_AT_PTS (120) index
+       points, the stop is never worse than the entry (added 2026-09-29).
     6. Square-off at SQUARE_OFF. Entries NO_NEW_ENTRY_BEFORE..NO_NEW_ENTRY_AFTER,
        at most MAX_TRADES_PER_DAY, one position at a time. After an exit a new
        cluster may only start on the bar after the exit bar.
@@ -95,6 +97,7 @@ BOX_PCT = 0.0025                    # box height as a fraction of price (0.25%)
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
 MAX_TRADES_PER_DAY = 2
+BREAKEVEN_AT_PTS = 120.0            # stop to entry once the best move reaches this; None = off
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
 # Active-day filter for the "filtered" book. VIX_MIN sits on the 13-14 plateau
@@ -553,6 +556,12 @@ def manage(client, name: str, book: dict, frame: pd.DataFrame) -> None:
         if moved != pos["stop"]:
             log(f"[{name}] trail: best +{pos['mfe']:.2f} pts, stop {pos['stop']:.2f} -> {moved:.2f}")
             pos["stop"] = moved
+    if BREAKEVEN_AT_PTS is not None and pos["mfe"] >= BREAKEVEN_AT_PTS:
+        moved = max(pos["stop"], pos["entry"]) if long else min(pos["stop"], pos["entry"])
+        if moved != pos["stop"]:
+            log(f"[{name}] breakeven: best +{pos['mfe']:.2f} pts clears {BREAKEVEN_AT_PTS:g}, "
+                f"stop {pos['stop']:.2f} -> {moved:.2f} (entry)")
+            pos["stop"] = moved
 
 
 def open_books(state: dict) -> list[tuple[str, dict]]:
@@ -710,7 +719,7 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting, PAPER ONLY - no order is ever sent: "
         f">= {MIN_CANDLES} candles in a {BOX_PCT:.2%} box, stop at the far side, "
-        f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, entries "
+        f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, breakeven at +{BREAKEVEN_AT_PTS} pts, entries "
         f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY}, "
         f"square-off {SQUARE_OFF:%H:%M}")
     breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
