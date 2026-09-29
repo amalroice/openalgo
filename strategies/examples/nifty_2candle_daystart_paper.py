@@ -74,7 +74,7 @@ Stop:
     inert and converges on doing nothing. Tightening pushes the stop-out rate
     back toward the 51.8% this buffer was introduced to escape. Do not retry it.
 
-Management (2 lots):
+Management (1 lot):
     target     OFF (TARGET_R = None). When set, the whole position is sold
                the moment the index trades TARGET_R times R past the entry, R
                being the entry less candle 1's low. Backtests badly; see there.
