@@ -1,6 +1,6 @@
-"""NIFTY 50 two-candle VWAP + SMA(45) breakout, ATM weekly options.
+"""NIFTY 50 two-candle VWAP + SMA(45) breakout, 100-pt ITM weekly options.
 
-Signals are read off NIFTY 50 SPOT on 5-minute candles; orders go to the ATM
+Signals are read off NIFTY 50 SPOT on 5-minute candles; orders go to the 100-pt ITM
 option of the nearest weekly expiry - CE on a long signal, PE on a short. Every
 stop, target and trail is measured in INDEX points, never in premium.
 
@@ -129,6 +129,7 @@ INTERVAL = "5m"
 SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
+ITM_POINTS = 100                    # strike this far in the money (CE below ATM, PE above); was ATM until 2026-09-29
 LOTS = 1                            # cut from 2 on 2026-09-20 for the first live week
 
 # Percent trailing stop, replacing 1-lot booking at +1.5R (+1R when the stop was
@@ -1100,8 +1101,14 @@ def initial_stop(sig: dict) -> float:
 # ORDERS
 # =============================================================================
 
-def resolve_atm(client, expiry: str, option_type: str) -> dict | None:
-    """Resolve the ATM option for one side against real listed strikes.
+def resolve_leg(client, expiry: str, option_type: str) -> dict | None:
+    """Resolve the option ITM_POINTS in the money for one side.
+
+    The ATM strike (listed strike nearest spot) comes from optionsymbol, then
+    the strike is moved ITM_POINTS into the money: down for a CE, up for a PE.
+    It is done in points, not with an ITMn offset, because ITMn counts listed
+    strikes and would land further out wherever the chain is spaced wider than
+    50. The target contract must be listed, or the entry is skipped.
 
     Returns:
         Dict with symbol and lotsize, or None when the lookup fails.
@@ -1112,7 +1119,22 @@ def resolve_atm(client, expiry: str, option_type: str) -> dict | None:
     if not ok(r):
         log(f"optionsymbol {option_type} failed: {r}")
         return None
-    return {"symbol": r["symbol"], "lotsize": int(r["lotsize"])}
+    prefix = f"{UNDERLYING}{expiry}"
+    atm_symbol = r["symbol"]
+    try:
+        atm = float(atm_symbol[len(prefix):-2])
+    except ValueError:
+        log(f"cannot read the strike from {atm_symbol}")
+        return None
+    strike = atm - ITM_POINTS if option_type == "CE" else atm + ITM_POINTS
+    symbol = f"{prefix}{strike:g}{option_type}"
+    s = client.symbol(symbol=symbol, exchange=FO_EXCHANGE)
+    if not ok(s):
+        log(f"{symbol} ({ITM_POINTS} pts ITM of {atm_symbol}) is not listed: {s}")
+        return None
+    log(f"strike {strike:g}: ATM {atm:g} (spot {r.get('underlying_ltp')}) "
+        f"moved {ITM_POINTS} pts ITM")
+    return {"symbol": symbol, "lotsize": int(r["lotsize"])}
 
 
 def nearest_weekly(client) -> str | None:
@@ -1930,7 +1952,7 @@ def cycle(client, state: dict) -> dict:
     expiry = nearest_weekly(client)
     if not expiry:
         return state
-    leg = resolve_atm(client, expiry, "CE" if sig["direction"] == "long" else "PE")
+    leg = resolve_leg(client, expiry, "CE" if sig["direction"] == "long" else "PE")
     if not leg:
         return state
 
