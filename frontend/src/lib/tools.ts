@@ -132,4 +132,11 @@ export const tools: Tool[] = [
     href: '/arbitrage',
     color: 'bg-green-600',
   },
+  {
+    title: 'Sector Heatmap',
+    description:
+      'Live heatmap of all NSE sectoral indices and their constituents, coloured by change from the previous close',
+    href: '/sectorheatmap',
+    color: 'bg-rose-500',
+  },
 ]

@@ -304,6 +304,12 @@ def react_arbitrage():
     return serve_react_app()
 
 
+# Sector Heatmap - NSE sectoral indices and their constituents
+@react_bp.route("/sectorheatmap")
+def react_sectorheatmap():
+    return serve_react_app()
+
+
 # WebSocket market data test page
 @react_bp.route("/websocket/test")
 def react_websocket_test():
