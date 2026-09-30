@@ -654,6 +654,14 @@ def cluster_text(cluster: dict | None) -> str:
             f"{cluster['low']:.2f}-{cluster['high']:.2f} ({cluster['high'] - cluster['low']:.2f} pts)")
 
 
+def box_atr_text(box: float, atr: float | None, cap: float) -> str:
+    """Box height as an ATR multiple against a book's cap, for the log."""
+    if atr is None:
+        return "ATR unreadable"
+    verdict = "within" if box <= cap * atr else "over"
+    return f"{box / atr:.2f}x ATR {atr:.2f}, {verdict} {cap:g}x"
+
+
 def cycle(client, state: dict) -> dict:
     now = datetime.now(IST)
     state = fresh_day(state, str(now.date()))
@@ -679,8 +687,13 @@ def cycle(client, state: dict) -> dict:
     for name, book in books.items():
         manage(client, name, book, frame)
 
-    # Shared per cycle, so every book sees the same quotes.
+    # Shared per cycle, so every book sees the same quotes. ATR is read every
+    # bar (prior sessions fetched once a day) so the log shows it even on days
+    # no breakout passes the active-day gate.
     gate_quotes: dict = {}
+    if BOOK_BOX_ATR_MAX:
+        prior = fetch_prior(client)
+        gate_quotes["atr"] = atr_now(prior, frame) if prior is not None else None
     legs: dict = {}
     parts = []
     for name, book in books.items():
@@ -692,7 +705,10 @@ def cycle(client, state: dict) -> dict:
         if book.get("cluster_from"):
             start = int((frame.index < pd.Timestamp(book["cluster_from"])).sum())
         sig, cluster = scan(frame, start)
-        parts.append(f"{name}: {cluster_text(cluster)}")
+        text = cluster_text(cluster)
+        if cluster and name in BOOK_BOX_ATR_MAX:
+            text += (f", {box_atr_text(cluster['high'] - cluster['low'], gate_quotes['atr'], BOOK_BOX_ATR_MAX[name])}")
+        parts.append(f"{name}: {text}")
         if not sig:
             continue
         side = sig["direction"]
@@ -703,18 +719,19 @@ def cycle(client, state: dict) -> dict:
             log(f"[{name}] {side} breakout skipped: {MAX_TRADES_PER_DAY} trades already today")
             continue
         if name in BOOK_VIX_MIN:
-            if not gate_quotes:
+            if "v" not in gate_quotes:
                 breadth = read_breadth(client) if BREADTH_MIN is not None else None
                 gate_quotes["v"] = (read_vix(client), breadth)
             passes, reading = active_day(*gate_quotes["v"], BOOK_VIX_MIN[name])
             if not passes:
-                log(f"[{name}] {side} breakout skipped, not an active day: {reading}")
+                would = ""
+                if name in BOOK_BOX_ATR_MAX:
+                    would = (f"; box {sig['high'] - sig['low']:.2f} pts would be "
+                             f"{box_atr_text(sig['high'] - sig['low'], gate_quotes['atr'], BOOK_BOX_ATR_MAX[name])}")
+                log(f"[{name}] {side} breakout skipped, not an active day: {reading}{would}")
                 continue
             log(f"[{name}] active day: {reading}")
         if name in BOOK_BOX_ATR_MAX:
-            if "atr" not in gate_quotes:
-                prior = fetch_prior(client)
-                gate_quotes["atr"] = atr_now(prior, frame) if prior is not None else None
             atr = gate_quotes["atr"]
             box = sig["high"] - sig["low"]
             cap = BOOK_BOX_ATR_MAX[name]
@@ -722,10 +739,9 @@ def cycle(client, state: dict) -> dict:
                 log(f"[{name}] {side} breakout skipped: ATR unreadable")
                 continue
             if box > cap * atr:
-                log(f"[{name}] {side} breakout skipped: box {box:.2f} pts is "
-                    f"{box / atr:.2f}x ATR {atr:.2f}, cap {cap:g}x")
+                log(f"[{name}] {side} breakout skipped: box {box:.2f} pts is {box_atr_text(box, atr, cap)}")
                 continue
-            log(f"[{name}] box {box:.2f} pts is {box / atr:.2f}x ATR {atr:.2f}, within {cap:g}x")
+            log(f"[{name}] box {box:.2f} pts is {box_atr_text(box, atr, cap)}")
 
         long = side == "long"
         if "spot" not in legs:
@@ -754,7 +770,11 @@ def cycle(client, state: dict) -> dict:
             "lotsize": leg["lotsize"] if leg else 0, "premium_in": premium,
         }
 
-    log(f"bar {bar:%H:%M} close {close:.2f} | " + " | ".join(parts))
+    atr_part = ""
+    if BOOK_BOX_ATR_MAX:
+        atr = gate_quotes["atr"]
+        atr_part = f" ATR{ATR_PERIOD} {atr:.2f}" if atr is not None else f" ATR{ATR_PERIOD} unreadable"
+    log(f"bar {bar:%H:%M} close {close:.2f}{atr_part} | " + " | ".join(parts))
     return state
 
 
