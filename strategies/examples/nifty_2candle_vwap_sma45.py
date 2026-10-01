@@ -70,8 +70,10 @@ Management (1 lot):
     trail      the stop sits TRAIL_DIST_PCT of the entry behind the best
                price, moved in TRAIL_STEP_PCT steps, and never below the
                candle stop. No partial booking, no line exit.
-    lock       once the trade has run LOCK_AT_R times its initial risk, the
-               stop is never worse than LOCK_TO_R times that risk in profit.
+    lock       OFF since 2026-10-01 (LOCK_AT_R = None). When on, once the
+               trade has run LOCK_AT_R times its initial risk, the stop is
+               never worse than LOCK_TO_R times that risk in profit.
+    breakeven  OFF since 2026-10-01 (BREAKEVEN_AT_PTS = None).
     broker     the resting broker stop is a mechanical-failure backstop only.
     15:00      everything is squared off
 
@@ -282,7 +284,18 @@ STEP_TRAIL_MOVE_PTS = 10.0
 #
 # It costs ~200 points over nine years for ~3.5 points of win rate and a
 # slightly shallower drawdown - a comfort trade, not an edge. None disables it.
-LOCK_AT_R = 1.5                     # arm once the best move reaches this many R
+#
+# OFF from 2026-10-01, user's decision, together with the breakeven stop below:
+# plain trail only. Replay of Jun-Sep 2026 on the live config, cost 3 pts:
+#
+#                    Jun     Jul     Aug     Sep    total
+#     lock + BE    +325.9  +100.6   +83.5  +196.9   +707
+#     plain trail  +240.4  +563.3  +104.1  +164.4  +1,072
+#
+# Most of the gap is 2026-07-08: BE +40 stopped a short at -1.3 that ran to
+# +395.3 at square-off. In June the lock saved two trades (+17.1/+5.5 against
+# -47.5/-15.3). Reproduce: session 0232dee0 scratchpad jun_cmp.py, jul_cmp.py.
+LOCK_AT_R = None                    # was 1.5 (2026-09-21..30)
 LOCK_TO_R = 0.5                     # then the stop is at least this many R in profit
 
 # Breakeven stop, ADDED 2026-09-24 on the user's decision, after they closed a
@@ -305,7 +318,7 @@ LOCK_TO_R = 0.5                     # then the stop is at least this many R in p
 # with a slightly shallower drawdown. The entry index level is not a
 # zero-rupee exit: the 3-pt cost and a bar-close fill make it a small loss.
 # None disables it. Reproduce: session 31c213d0 scratchpad be_sweep.py.
-BREAKEVEN_AT_PTS = 40.0
+BREAKEVEN_AT_PTS = None             # was 40.0 (2026-09-24..30); off with the lock, see LOCK_AT_R
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
