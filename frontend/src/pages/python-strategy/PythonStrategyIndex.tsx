@@ -36,6 +36,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { MasterContractStatus, PythonStrategy } from '@/types/python-strategy'
@@ -50,6 +51,9 @@ export default function PythonStrategyIndex() {
   const [actionLoading, setActionLoading] = useState<string | null>(null)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [strategyToDelete, setStrategyToDelete] = useState<PythonStrategy | null>(null)
+  const [renameDialogOpen, setRenameDialogOpen] = useState(false)
+  const [strategyToRename, setStrategyToRename] = useState<PythonStrategy | null>(null)
+  const [renameValue, setRenameValue] = useState('')
   const [currentTime, setCurrentTime] = useState(new Date())
 
   const fetchData = async (silent = false) => {
@@ -174,6 +178,36 @@ export default function PythonStrategyIndex() {
       setActionLoading(null)
       setDeleteDialogOpen(false)
       setStrategyToDelete(null)
+    }
+  }
+
+  const openRenameDialog = (strategy: PythonStrategy) => {
+    setStrategyToRename(strategy)
+    setRenameValue(strategy.name)
+    setRenameDialogOpen(true)
+  }
+
+  const handleRename = async () => {
+    if (!strategyToRename) return
+    const name = renameValue.trim()
+    if (!name) return
+    try {
+      setActionLoading(strategyToRename.id)
+      const response = await pythonStrategyApi.renameStrategy(strategyToRename.id, name)
+      if (response.status === 'success') {
+        showToast.success(response.message || 'Strategy renamed', 'pythonStrategy')
+        setRenameDialogOpen(false)
+        setStrategyToRename(null)
+        fetchData()
+      } else {
+        showToast.error(response.message || 'Failed to rename strategy', 'pythonStrategy')
+      }
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { message?: string } } }
+      const errorMessage = axiosError.response?.data?.message || 'Failed to rename strategy'
+      showToast.error(errorMessage, 'pythonStrategy')
+    } finally {
+      setActionLoading(null)
     }
   }
 
@@ -401,6 +435,10 @@ export default function PythonStrategyIndex() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => openRenameDialog(strategy)}>
+                          <Pencil className="h-4 w-4 mr-2" />
+                          Rename
+                        </DropdownMenuItem>
                         <DropdownMenuItem onClick={() => handleExport(strategy)}>
                           <Download className="h-4 w-4 mr-2" />
                           Export
@@ -567,6 +605,36 @@ export default function PythonStrategyIndex() {
           ))}
         </div>
       )}
+
+      {/* Rename Dialog */}
+      <Dialog open={renameDialogOpen} onOpenChange={setRenameDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rename Strategy</DialogTitle>
+            <DialogDescription>
+              Display name only - the strategy id, script file and schedule are unchanged.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleRename()
+            }}
+            maxLength={100}
+            placeholder="Strategy name"
+            autoFocus
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenameDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleRename} disabled={!renameValue.trim()}>
+              Rename
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete Dialog */}
       <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>

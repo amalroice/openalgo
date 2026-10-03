@@ -84,6 +84,17 @@ export const pythonStrategyApi = {
   },
 
   /**
+   * Rename a strategy (display label only)
+   */
+  renameStrategy: async (strategyId: string, name: string): Promise<ApiResponse<{ name: string }>> => {
+    const response = await webClient.post<ApiResponse<{ name: string }>>(
+      `/python/rename/${strategyId}`,
+      { name }
+    )
+    return response.data
+  },
+
+  /**
    * Export strategy file
    */
   exportStrategy: async (

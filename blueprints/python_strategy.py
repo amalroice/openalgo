@@ -2730,6 +2730,55 @@ def save_strategy(strategy_id):
         return jsonify({"status": "error", "message": f"Failed to save: {str(e)}"}), 500
 
 
+@python_strategy_bp.route("/rename/<strategy_id>", methods=["POST"])
+@check_session_validity
+def rename_strategy(strategy_id):
+    """Rename a strategy's display label.
+
+    Metadata only - the strategy id, file and schedule are untouched, so this
+    is safe while the strategy is running.
+    """
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Session expired"}), 401
+
+    # Verify ownership and get config atomically
+    is_owner, result = verify_strategy_ownership(strategy_id, user_id, return_config=True)
+    if not is_owner:
+        return result
+
+    config = result
+
+    data = request.get_json(silent=True) or {}
+    # Same sanitisation as upload: display name, stripped and length-capped.
+    # Non-strings (null, numbers) are treated as missing rather than stringified.
+    raw_name = data.get("name")
+    new_name = raw_name.strip()[:100] if isinstance(raw_name, str) else ""
+    if not new_name:
+        return jsonify({"status": "error", "message": "Name is required"}), 400
+
+    old_name = config.get("name", "")
+    if new_name == old_name:
+        return jsonify({"status": "success", "message": "Name unchanged"})
+
+    try:
+        config["name"] = new_name
+        save_configs()
+        logger.info(f"Strategy {strategy_id} renamed from {old_name!r} to {new_name!r}")
+        # Lets open SSE listeners refresh the list without a manual reload
+        broadcast_status_update(strategy_id, "renamed", new_name)
+        return jsonify(
+            {
+                "status": "success",
+                "message": f'Strategy renamed to "{new_name}"',
+                "data": {"name": new_name},
+            }
+        )
+    except Exception as e:
+        logger.exception(f"Failed to rename strategy {strategy_id}: {e}")
+        return jsonify({"status": "error", "message": "Failed to rename strategy"}), 500
+
+
 # Cleanup on shutdown
 def cleanup_on_exit():
     """Clean up all running processes on application exit"""
