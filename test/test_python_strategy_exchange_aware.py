@@ -62,6 +62,22 @@ def calendar_db():
     return mc
 
 
+@pytest.fixture(autouse=True)
+def _isolate_config_file(tmp_path):
+    """Never let a test write the real strategies/strategy_configs.json.
+
+    save_configs() writes through the module-level CONFIG_FILE, so any test
+    that mutates STRATEGY_CONFIGS and lets the real save happen would replace
+    a live instance's config with test fixtures.
+    """
+    from blueprints import python_strategy as ps
+
+    original = ps.CONFIG_FILE
+    ps.CONFIG_FILE = tmp_path / "strategy_configs.json"
+    yield
+    ps.CONFIG_FILE = original
+
+
 @pytest.fixture()
 def ps_module(calendar_db):
     """Reset state on the (single) python_strategy module instance.
