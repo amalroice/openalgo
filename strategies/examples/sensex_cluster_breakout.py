@@ -1,9 +1,20 @@
-"""SENSEX range-cluster breakout, 5-minute candles. PAPER ONLY.
+"""SENSEX range-cluster breakout, 5-minute candles.
 
-This script never places an order: there is no order call anywhere in it. It
-reads SENSEX spot (BSE_INDEX), finds the signals, and logs a paper record with
-the real premium of the weekly BFO option ITM_POINTS (100) in the money - CE
-below ATM, PE above; ATM until 2026-09-29 - at entry and exit.
+Live from 2026-10-03: with TRADE_LIVE the script sends real orders - a market
+BUY of LIVE_LOTS of the weekly BFO option ITM_POINTS (100) in the money - CE
+below ATM, PE above; ATM until 2026-09-29 - on the signal, a broker-side SL-M
+backstop sized off the index stop, and market SELL exits when the index poll
+or a bar touches the stop, on the trail, and at the 15:00 square-off. Every
+exit cancels the backstop first, so a backstop firing mid-exit is detected
+instead of sold twice. TRADE_LIVE = False returns every path to the old paper
+record: premiums quoted, no order ever sent. Orders follow the platform's
+Analyze (sandbox) versus Live mode, so the same script can be dry run on the
+sandbox before real money is at risk. Exit failures are retried, never
+assumed flat.
+
+There is no target: winners ride to the square-off on the trail, losers are
+cut at the box stop, and every exit logs the index slippage against the stop
+plus, live, the option fill against the premium quoted at entry.
 
 Rule (long; short is the mirror):
     1. Cluster: at least MIN_CANDLES consecutive completed candles that all fit
@@ -35,12 +46,9 @@ Active-day filter (added 2026-09-27), read when a signal fires:
     (41,258 vs 42,044 pts) from 853 more trades, with maxDD -3,863 vs -2,029
     and OOS PF 1.28 vs 1.45.
 
-Three paper books run side by side on the same bars, each with its own
-position, trade count and cluster restart, exactly as the backtest runs them:
-    filtered   the rule above WITH the active-day filter (the candidate)
-    boxatr     filtered, and the box is at most BOX_ATR_MAX (2) x ATR(14) of
-               the 5m bars at the signal bar (added 2026-09-29)
-    plain      the rule above WITHOUT it (the comparison)
+One book runs every session: boxatr applies the active-day filter and
+requires the box to be at most BOX_ATR_MAX (2) x ATR(14) at the signal bar.
+The filtered-only comparison and unfiltered plain book have been removed.
 
 boxatr skips breakouts from boxes that are wide for the current volatility.
 Over 2016-10..2026-09-25 against filtered: 1,324 vs 1,768 trades, net 36,297
@@ -69,10 +77,12 @@ The filtered book sits out low-VIX spells: Aug-Sep 2026 (VIX 10-12.6) gave
 it 2 trades in 8 weeks against 54 for plain. Breadth in the backtest uses
 today's NIFTY 50 list for every year, which flatters the early years.
 
-THE REASON THIS DRY RUN EXISTS is the stop fill: the backtest fills every stop
-exactly at the stop level. Every stop exit here logs the index price actually
-seen when the stop was crossed, and the gap ("slippage"). Reproduce: Claude
-session 687c73c7 scratchpad cluster_edge.py / edge_gates.py / edge_oos.py.
+THE REASON THIS STRATEGY WAS PAPER FIRST is the stop fill: the backtest
+fills every stop exactly at the stop level. Every stop exit - paper or live -
+logs the index price actually seen when the stop was crossed and the gap
+("slippage"), and live also logs the option fill against the premium quoted
+at the signal. Reproduce: Claude session 687c73c7 scratchpad cluster_edge.py /
+edge_gates.py / edge_oos.py.
 
 Note on logging: the strategy host captures stdout to log/strategies/, so
 print() is the logging channel here. That is the host contract and differs
@@ -82,6 +92,7 @@ deliberately from the repo-wide rule that application modules use utils.logging.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import sys
@@ -112,20 +123,32 @@ MAX_TRADES_PER_DAY = 2
 BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points at every level tested
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
-# Active-day filter for the "filtered" book. VIX_MIN sits on the 13-14 plateau
+# Live orders. TRADE_LIVE False makes every path paper-only again. Orders
+# follow the platform's Analyze (sandbox) versus Live mode, so this same code
+# can be dry run on the sandbox before real money is at risk.
+TRADE_LIVE = True
+LIVE_LOTS = 1                       # lots per entry; quantity = lots x lotsize
+LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
+ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
+ORDER_POLL_SECONDS = 1
+SLM_DELTA = 0.95                    # assumed option points per index point (backstop sizing)
+SLM_BUFFER_PCT = 0.01               # backstop sits this far below the paper-exit premium
+SLM_TICK = 0.05                     # index option price tick
+
+# Active-day filter for the gated books. VIX_MIN sits on the 13-14 plateau
 # of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau. None switches
 # the breadth part off so VIX alone gates (tried 2026-09-29, backtests worse).
 VIX_MIN = 13.0
 BREADTH_MIN = 2.0
 # VIX floor per gated book; every book not listed here is ungated.
-BOOK_VIX_MIN = {"filtered": VIX_MIN, "boxatr": VIX_MIN}
+BOOK_VIX_MIN = {"boxatr": VIX_MIN}
 # Box height cap in ATR(14) multiples, per book; books not listed have none.
 BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
 ATR_PERIOD = 14
 ATR_WARMUP_DAYS = 10                # calendar days of prior bars for the ATR
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
-BOOKS = ("filtered", "boxatr", "plain")
-ITM_POINTS = 100                    # paper strike this far in the money; was ATM until 2026-09-29
+BOOKS = ("boxatr",)
+ITM_POINTS = 100                    # strike this far in the money; was ATM until 2026-09-29
 
 SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(9, 30)
@@ -324,7 +347,7 @@ def index_ltp(client) -> float | None:
 
 
 def option_ltp(client, symbol: str) -> float | None:
-    """Last traded premium of one option leg, for the paper record."""
+    """Last traded premium of one option leg, for the entry and exit record."""
     try:
         q = client.quotes(symbol=symbol, exchange=FO_EXCHANGE)
     except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
@@ -365,7 +388,8 @@ def resolve_leg(client, option_type: str) -> dict | None:
     ATM (listed strike nearest spot) comes from optionsymbol; the strike then
     moves ITM_POINTS into the money, down for a CE and up for a PE. Points, not
     an ITMn offset, because ITMn counts listed strikes. The target contract
-    must be listed, or the paper leg is left unresolved.
+    must be listed, or the leg is left unresolved - paper logs the signal and
+    enters without a premium, live stays flat.
     """
     expiry = nearest_weekly(client)
     if not expiry:
@@ -544,6 +568,10 @@ def save_state(state: dict) -> None:
 def fresh_day(state: dict, today: str) -> dict:
     if state.get("date") != today or "books" not in state:
         state = {"date": today, "books": {}}
+    else:
+        # Retire removed comparison books on restart so they cannot keep running.
+        state["books"] = {name: state["books"][name]
+                          for name in BOOKS if name in state["books"]}
     # A book added mid-day (restart after an upgrade) joins with a clean slate.
     for name in BOOKS:
         state["books"].setdefault(
@@ -552,15 +580,194 @@ def fresh_day(state: dict, today: str) -> dict:
 
 
 # =============================================================================
-# PAPER POSITIONS  (one per book)
+# LIVE ORDERS
 # =============================================================================
 
-def paper_exit(client, name: str, book: dict, price: float, why: str, bar_start: str) -> None:
-    """Close one book's paper position and log index and option results."""
+
+def wait_order(client, orderid: str) -> tuple[str, float | None]:
+    """Poll one order toward a terminal state; a timeout cancels it first.
+
+    Returns (status, average fill): "complete" carries the traded price
+    (None when the tradebook could not price it, so the caller falls back to
+    a quote), "rejected"/"cancelled" carry None, and anything else means the
+    order could not be settled - the caller must not assume the position
+    exists (entry) or is gone (exit).
+    """
+    status = "open"
+    for attempt in range(ORDER_POLL_TRIES):
+        if attempt:
+            time.sleep(ORDER_POLL_SECONDS)
+        r = client.orderstatus(order_id=orderid, strategy=STRATEGY_TAG)
+        if not ok(r):
+            continue
+        data = r.get("data") or {}
+        status = str(data.get("order_status", "")).lower() or status
+        if status == "complete":
+            return status, float(data.get("average_price") or 0) or None
+        if status in ("rejected", "cancelled"):
+            return status, None
+    client.cancelorder(order_id=orderid, strategy=STRATEGY_TAG)
+    r = client.orderstatus(order_id=orderid, strategy=STRATEGY_TAG)
+    if ok(r):
+        data = r.get("data") or {}
+        status = str(data.get("order_status", "")).lower() or status
+        if status == "complete":
+            return status, float(data.get("average_price") or 0) or None
+    return status, None
+
+
+def slm_trigger(premium_in: float, risk_pts: float) -> float | None:
+    """Backstop trigger for the option leg, or None when it prices below a tick.
+
+    The stop is an INDEX level but the SL-M must be an OPTION price: assume
+    the premium moves SLM_DELTA points per index point (deep-ITM weekly, so
+    most of the move) and sit SLM_BUFFER_PCT below the paper-exit premium, so
+    the backstop only fires for a move the index poll did not take - a dead
+    script or a gap through the stop. Firing early would front-run the
+    strategy's own exit, which is why the bias is late, never exact.
+    """
+    raw = premium_in * (1 - SLM_BUFFER_PCT) - SLM_DELTA * risk_pts
+    if raw < SLM_TICK:
+        return None
+    return math.floor(raw / SLM_TICK) * SLM_TICK
+
+
+def live_entry(client, leg: dict, spot: float, stop: float) -> dict | None:
+    """Market-buy LIVE_LOTS of the leg, then park the broker-side backstop.
+
+    Returns the fills and order ids for the position dict, or None when
+    nothing filled: the signal is dropped rather than retried, exactly as the
+    paper book drops a signal it cannot price.
+    """
+    qty = int(leg["lotsize"]) * LIVE_LOTS
+    try:
+        r = client.placeorder(strategy=STRATEGY_TAG, symbol=leg["symbol"], action="BUY",
+                              exchange=FO_EXCHANGE, price_type="MARKET",
+                              product=LIVE_PRODUCT, quantity=qty)
+    except Exception as exc:  # noqa: BLE001 - a transport blip must not kill the day
+        log(f"LIVE entry raised {exc!r} for {leg['symbol']} x{qty}")
+        return None
+    if not ok(r):
+        log(f"LIVE entry rejected: {leg['symbol']} x{qty}: {r}")
+        return None
+    orderid = str(r.get("orderid") or "")
+    try:
+        status, fill = wait_order(client, orderid)
+    except Exception as exc:  # noqa: BLE001 - never leave an order unwatched
+        log(f"LIVE entry {orderid} unsettled ({exc!r}); cancelling blind, dropping the signal")
+        try:
+            client.cancelorder(order_id=orderid, strategy=STRATEGY_TAG)
+        except Exception as cancel_exc:  # noqa: BLE001
+            log(f"cancel of {orderid} failed: {cancel_exc!r}")
+        return None
+    if status != "complete":
+        log(f"LIVE entry {orderid} ended '{status}'; dropping the signal, staying flat")
+        return None
+    if not fill:
+        fill = option_ltp(client, leg["symbol"])
+    trigger = slm_trigger(fill, abs(spot - stop)) if fill else None
+    slm_id = None
+    shown = fill if fill else "unknown"
+    if trigger is None:
+        log(f"LIVE entry {orderid}: filled {shown} x{qty}, no usable SL-M backstop "
+            "(premium too close to the risk) - the index poll is the only exit")
+    else:
+        try:
+            sr = client.placeorder(strategy=STRATEGY_TAG, symbol=leg["symbol"], action="SELL",
+                                   exchange=FO_EXCHANGE, price_type="SL-M",
+                                   product=LIVE_PRODUCT, quantity=qty,
+                                   trigger_price=f"{trigger:.2f}")
+        except Exception as exc:  # noqa: BLE001 - the index poll still exits
+            log(f"LIVE entry {orderid}: filled {shown} x{qty}, SL-M raised {exc!r}; "
+                "index poll is the only exit")
+            sr = None
+        if ok(sr):
+            slm_id = str(sr.get("orderid") or "")
+            log(f"LIVE entry {orderid}: filled {shown} x{qty}, SL-M backstop "
+                f"{trigger:.2f} (order {slm_id})")
+        elif sr is not None:
+            log(f"LIVE entry {orderid}: filled {shown} x{qty}, SL-M NOT placed ({sr}); "
+                "index poll is the only exit")
+    return {"buy_orderid": orderid, "slm_orderid": slm_id,
+            "slm_trigger": trigger, "premium_in": fill, "qty": qty}
+
+
+def live_close(client, pos: dict) -> tuple[str, float | None]:
+    """Cancel the SL-M backstop, then market-sell the full quantity.
+
+    Returns (how, premium_out): "closed" - we sold it; "already-flat" - the
+    backstop fired first and its fill is the exit; "failed" - nothing
+    settled, so the caller keeps the position and retries. A sell is never
+    sent while the backstop could still fire.
+    """
+    slm = pos.get("slm_orderid")
+    if slm:
+        if not ok(client.cancelorder(order_id=slm, strategy=STRATEGY_TAG)):
+            st = client.orderstatus(order_id=slm, strategy=STRATEGY_TAG)
+            data = (st.get("data") or {}) if ok(st) else {}
+            status = str(data.get("order_status", "")).lower()
+            if status == "complete":
+                fill = float(data.get("average_price") or 0) or None
+                return "already-flat", fill or option_ltp(client, pos["symbol"])
+            log(f"SL-M {slm} would not cancel ({status or 'unknown'}); "
+                "refusing to sell twice, the next poll retries")
+            return "failed", None
+        pos["slm_orderid"] = None
+    qty = int(pos.get("qty") or 0)
+    try:
+        r = client.placeorder(strategy=STRATEGY_TAG, symbol=pos["symbol"], action="SELL",
+                              exchange=FO_EXCHANGE, price_type="MARKET",
+                              product=LIVE_PRODUCT, quantity=qty)
+    except Exception as exc:  # noqa: BLE001 - treated as unsettled below
+        log(f"LIVE sell raised {exc!r} for {pos['symbol']} x{qty}")
+        return "failed", None
+    if not ok(r):
+        log(f"LIVE sell rejected: {pos['symbol']} x{qty}: {r}")
+        return "failed", None
+    orderid = str(r.get("orderid") or "")
+    try:
+        status, fill = wait_order(client, orderid)
+    except Exception as exc:  # noqa: BLE001 - never leave a sell running unwatched
+        log(f"LIVE sell {orderid} unsettled ({exc!r}); cancelling blind")
+        try:
+            client.cancelorder(order_id=orderid, strategy=STRATEGY_TAG)
+        except Exception as cancel_exc:  # noqa: BLE001
+            log(f"cancel of {orderid} failed: {cancel_exc!r}")
+        return "failed", None
+    if status == "complete":
+        return "closed", fill or option_ltp(client, pos["symbol"])
+    log(f"LIVE sell {orderid} ended '{status}'; the position stays for a retry")
+    return "failed", None
+
+
+# =============================================================================
+# POSITIONS  (one per book)
+# =============================================================================
+
+def close_position(client, name: str, book: dict, price: float, why: str,
+                   bar_start: str) -> bool:
+    """Close the book's position and log index and option results.
+
+    Live, the SL-M backstop is cancelled BEFORE the market sell - never the
+    other way round - so a backstop caught mid-fire reads as "already flat"
+    instead of being sold twice. Returns False when a live exit could not be
+    settled, leaving the position in place for the next poll to retry.
+    """
     pos = book["position"]
+    live = bool(pos.get("buy_orderid"))
+    note = ""
+    premium = None
+    if live:
+        how, premium = live_close(client, pos)
+        if how == "failed":
+            log(f"[{name}] LIVE exit ({why}) unsettled; keeping the position for a retry")
+            return False
+        if how == "already-flat":
+            note = "; SL-M backstop fired first"
+    else:
+        premium = option_ltp(client, pos["symbol"]) if pos.get("symbol") else None
     long = pos["direction"] == "long"
     gross = (price - pos["entry"]) if long else (pos["entry"] - price)
-    premium = option_ltp(client, pos["symbol"]) if pos.get("symbol") else None
     opt = ""
     if premium is not None and pos.get("premium_in") is not None:
         opt_pts = premium - pos["premium_in"]
@@ -570,9 +777,10 @@ def paper_exit(client, name: str, book: dict, price: float, why: str, bar_start:
     if why == "stop":
         gap = (pos["stop"] - price) if long else (price - pos["stop"])
         slip = f"; stop {pos['stop']:.2f}, seen {price:.2f}, slippage {gap:+.2f} pts"
-    log(f"[{name}] PAPER EXIT {why}: {pos['direction']} {pos['entry']:.2f} -> {price:.2f}, "
+    label = "LIVE" if live else "PAPER"
+    log(f"[{name}] {label} EXIT {why}: {pos['direction']} {pos['entry']:.2f} -> {price:.2f}, "
         f"index {gross:+.2f} pts gross, {gross - COST_PTS:+.2f} after {COST_PTS:.0f} cost"
-        f"{slip}{opt}")
+        f"{slip}{opt}{note}")
     book["closed"].append({"direction": pos["direction"], "entry": pos["entry"],
                            "exit": price, "why": why, "gross": round(gross, 2),
                            "stop": pos["stop"], "premium_in": pos.get("premium_in"),
@@ -581,6 +789,7 @@ def paper_exit(client, name: str, book: dict, price: float, why: str, bar_start:
     # The backtest restarts the cluster on the bar after the exit bar.
     book["cluster_from"] = bar_start
     book["position"] = None
+    return True
 
 
 def next_bar_start(stamp: datetime) -> str:
@@ -604,7 +813,7 @@ def manage(client, name: str, book: dict, frame: pd.DataFrame) -> None:
     if touched:
         price = index_ltp(client) or pos["stop"]
         log(f"[{name}] bar {since.index[-1]:%H:%M} traded through the stop between polls")
-        paper_exit(client, name, book, price, "stop", next_bar_start(since.index[-1]))
+        close_position(client, name, book, price, "stop", next_bar_start(since.index[-1]))
         return
     best = (float(since["high"].max()) - pos["entry"]) if long else (pos["entry"] - float(since["low"].min()))
     pos["mfe"] = max(pos.get("mfe", 0.0), best)
@@ -639,7 +848,7 @@ def watch_stop(client, state: dict, deadline: float) -> None:
             pos = book["position"]
             long = pos["direction"] == "long"
             if (price <= pos["stop"]) if long else (price >= pos["stop"]):
-                paper_exit(client, name, book, price, "stop", next_bar_start(datetime.now(IST)))
+                close_position(client, name, book, price, "stop", next_bar_start(datetime.now(IST)))
                 save_state(state)
 
 
@@ -673,7 +882,7 @@ def cycle(client, state: dict) -> dict:
             price = index_ltp(client)
             if price is not None:
                 for name, book in open_now:
-                    paper_exit(client, name, book, price, "square-off", now.isoformat())
+                    close_position(client, name, book, price, "square-off", now.isoformat())
         return state
 
     frame = fetch_today(client)
@@ -758,17 +967,27 @@ def cycle(client, state: dict) -> dict:
             legs[opt_type] = (leg, option_ltp(client, leg["symbol"]) if leg else None)
         leg, premium = legs[opt_type]
         shown = f"{premium:.2f}" if premium is not None else "unknown"
-        log(f"[{name}] PAPER {side.upper()}: close {close:.2f} broke the {sig['candles']}-candle box "
+        head = "LIVE signal" if TRADE_LIVE else "PAPER"
+        log(f"[{name}] {head} {side.upper()}: close {close:.2f} broke the {sig['candles']}-candle box "
             f"{sig['low']:.2f}-{sig['high']:.2f}; entry {spot:.2f}, stop {stop:.2f} "
             f"(risk {risk:.2f} pts); {leg['symbol'] if leg else 'option unresolved'} premium {shown}")
-        book["trades"] = book.get("trades", 0) + 1
-        book["position"] = {
+        position = {
             "direction": side, "entry": spot, "stop": stop, "risk": risk,
             "mfe": 0.0, "opened": now.isoformat(),
             "entry_bar": (bar + timedelta(seconds=BAR_SECONDS)).isoformat(),
             "symbol": leg["symbol"] if leg else None,
             "lotsize": leg["lotsize"] if leg else 0, "premium_in": premium,
         }
+        if TRADE_LIVE:
+            if not leg:
+                log(f"[{name}] live entry skipped: option unresolved; staying flat")
+                continue
+            fills = live_entry(client, leg, spot, stop)
+            if fills is None:
+                continue            # rejected or unsettled: no position, no trade counted
+            position.update(fills)
+        book["trades"] = book.get("trades", 0) + 1
+        book["position"] = position
 
     atr_part = ""
     if BOOK_BOX_ATR_MAX:
@@ -812,15 +1031,18 @@ def main() -> int:
     client = build_client()
     be_text = (f"breakeven at +{BREAKEVEN_AT_PTS:g} pts" if BREAKEVEN_AT_PTS is not None
                else "breakeven off")
-    log(f"{STRATEGY_TAG} starting, PAPER ONLY - no order is ever sent: "
+    mode = (f"LIVE: {LIVE_LOTS} lot {LIVE_PRODUCT} market orders with a broker SL-M "
+            "backstop, exit failures retried (Analyze mode routes them to the sandbox); "
+            "TRADE_LIVE = False is paper") if TRADE_LIVE else "PAPER ONLY - no order is ever sent"
+    log(f"{STRATEGY_TAG} starting, {mode}: "
         f">= {MIN_CANDLES} candles in a {BOX_PCT:.2%} box, stop at the far side, "
         f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, {be_text}, entries "
         f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY}, "
         f"square-off {SQUARE_OFF:%H:%M}")
     breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
                     if BREADTH_MIN is not None else ", breadth filter off")
-    log(f"books: filtered (VIX > {VIX_MIN:g}{breadth_rule}), boxatr (filtered and box <= "
-        f"{BOOK_BOX_ATR_MAX['boxatr']:g}x ATR{ATR_PERIOD}) and plain (no filter); "
+    log(f"book: boxatr (VIX > {VIX_MIN:g}{breadth_rule}, box <= "
+        f"{BOOK_BOX_ATR_MAX['boxatr']:g}x ATR{ATR_PERIOD}); "
         f"option {ITM_POINTS} pts ITM")
 
     state = load_state()
