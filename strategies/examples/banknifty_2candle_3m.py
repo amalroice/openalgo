@@ -1,53 +1,86 @@
-"""BANKNIFTY two-candle VWAP + SMA(45) breakout on 3-minute candles. PAPER ONLY.
+"""BANKNIFTY two-candle VWAP + SMA(45) breakdown on 3-minute candles. LIVE.
 
-This script never places an order: there is no order call anywhere in it. It
-reads BANKNIFTY spot (NSE_INDEX), finds the signals, and logs a paper record
-with the real premium of the nearest monthly NFO option ITM_POINTS (200) in the
-money - CE below ATM, PE above - at entry and exit. BANKNIFTY has listed
-monthly expiries only since November 2024.
+TRADES REAL ORDERS. The signal is read off BANKNIFTY spot (NSE_INDEX); the
+order goes to the nearest monthly NFO option ITM_POINTS (200) in the money.
+The rule is short-only, so in practice that leg is always a PE. BANKNIFTY has
+listed monthly expiries only since November 2024.
+
+SAFETY. assert_live_allowed runs at startup: it reads the instance's analyzer
+(sandbox) flag. In analyzer mode OpenAlgo simulates the orders. Outside it, a
+real order is placed only because I_UNDERSTAND_THIS_IS_LIVE is True - set that
+False to refuse them. DRY_RUN=True resolves and logs every order without
+sending one. LIVE_BOOK names the single book that goes live; the other stays
+paper for comparison, so the two books never double a real position. A resting
+stop-limit is parked at the broker on every live entry, sized off the option's
+own Greeks (delta and gamma map the index stop to a premium, widened by theta
+to square-off and BROKER_STOP_IV_POINTS of vega). It is a disaster backstop
+BEHIND the in-process stop, not a tighter second stop: the in-process stop and
+target still exit normally, and the resting stop only fires if the process dies
+or the index gaps. It is cancelled before every exit so it can never
+double-sell, and an orphaned one is pulled when the broker reports the position
+already flat. Set BROKER_STOP = False to rely on the in-process poll alone.
+
+SHORT-ONLY, ATR stop and a 100-point target since 2026-10-04. The long side
+was removed and the exit rebuilt after a 478-session study (2024-10-01 ..
+2026-09-30): the raw rule won 24.5% of its trades, and the change below lifts
+that to 62.4% with a higher profit factor. See EVIDENCE at the end.
 
 Bars: 3-minute candles built from 1-minute history, anchored at 09:15, exactly
 as the backtest builds them. VWAP is the day's index typical price weighted by
-the summed volume of the six largest banks (the index has none). SMA(45) runs
-over 3m closes across sessions, so prior sessions are fetched once a day.
+the summed volume of the six largest banks (the index has none). SMA(45) and
+ATR(14) run over the same 3m bars across sessions, so prior sessions are
+fetched once a day.
 
-Rule (long; short is the mirror):
-    1. Two consecutive completed candles lie COMPLETELY above both VWAP and
-       SMA(45) (low above the higher of the two lines), the candle before them
-       did not, and candle 2 closes above candle 1's close.
+Rule (short; the long mirror is computed but not traded - see DIRECTIONS):
+    1. Two consecutive completed candles lie COMPLETELY below both VWAP and
+       SMA(45) (high below the lower of the two lines), the candle before them
+       did not, and candle 2 closes below candle 1's close.
     2. Entry: at the next bar's open - here, the index price when candle 2 has
        just completed - between NO_NEW_ENTRY_BEFORE (10:15) and
        NO_NEW_ENTRY_AFTER (14:30).
-    3. Stop: candle 1's low less STOP_BUFFER_PCT (0.02%) of price.
-    4. No target and no trail: held to the stop or SQUARE_OFF (15:00).
+    3. Stop: ATR_STOP_MULT (3) times ATR(14) of the 3m bars beyond the entry,
+       so the stop breathes with volatility instead of pinning candle 1. The
+       candle-1 stop is kept only as a fallback while the ATR has not warmed.
+    4. Target: TARGET_PTS (100) index points from the entry, banked the moment
+       the index trades there. No trail.
     5. At most MAX_TRADES_PER_DAY (2), one position at a time per book.
 
-Two paper books run side by side on the same bars:
+Two books run side by side on the same bars; LIVE_BOOK places the real order
+and the other is paper:
     plain     the rule above
     breadth   the rule above, taken only when the 14 NIFTY Bank stocks are
               one-sided by BREADTH_MIN (2x): advancers at least twice decliners
               or the reverse, in EITHER direction ("a decisive day"), read
               against each stock's previous close when the signal fires.
 
-Backtest, BANKNIFTY 1m -> 3m, 2021-01..2026-09-30, 4 pts cost a trade, 1 lot
-of 30, stops filled AT the stop. Chosen on 2021-23, validated on 2024-25,
-2026 untouched until the end:
+EVIDENCE - rebuilt 2026-10-04 from cached 1m bars (478 sessions, 2024-10-01 ..
+2026-09-30), 4 pts cost a trade, 1 lot of 30, stops and targets filled AT their
+level, a bar that touches both scored as a stop:
 
-                 trades  2021-23 PF  2024-25 PF  2026 PF  gross/trade  PF @8 pts
-    plain         1,981     1.19        1.06       1.30     +10.9        1.06
-    breadth       1,343     1.27        1.11       1.32     +13.6        1.12
+    book                 2025     2026   last 100    full 2025-26
+    raw rule (both dir)  23.8%    25.6%    24.8%       24.5%   (PF 1.16)
+    short + ATR3 + 100   59.6%    66.0%    61.7%       62.4%   (PF 1.28)
 
-    plain by year (Rs): 144,465 / 50,667 / 46,045 / 13,608 / 40,810 / 2026 117,301
-    breadth by year:    179,420 / 13,425 / 45,798 / 80,770 / -19,764 / 2026 87,097
+    full: 319 trades, win 62.4%, +3,995 index pts (Rs 119,863 a lot), PF 1.28,
+    maxDD -1,109 pts against -2,598 for the raw rule. By year: 2025 +1,631
+    (PF 1.21), 2026 +2,364 (PF 1.38). Exit mix: 184 target, 95 stop, 40
+    square-off.
 
-    Breadth in the trade's direction (the NIFTY live rule) HURT here: 1.5x
-    gave PF 1.00 / 0.96 / 0.99. Only the either-direction test helps.
+    Why short-only: the long-side mirror, with this same exit, won ~52% of its
+    trades but still lost money in every window (2025 -1,632, 2026 -3,595,
+    full -5,226 pts; PF 0.75) - its winners are smaller than its losers. The
+    breakout has paid on the downside, not the upside, so the long side is
+    disabled rather than kept as a drag.
 
-THE REASON THIS DRY RUN EXISTS is cost: the edge is only ~11-14 index points
-a trade, about what monthly-option spreads and slippage may take. Every exit
-logs the option premium in and out, and every stop exit the index price
-actually seen. Reproduce: Claude session c8d3fa98 scratchpad bnf_lowtf.py /
-bnf3m_breadth.py.
+    The ATR stop x fixed target region is broad - ATR 2.5-3.5 x 75-130 pts all
+    give 54-69% win and PF 1.1-1.4 - so 3.0 and 100 are a point on a plateau,
+    not a fitted optimum. Reproduce: backtesting/banknifty-2candle/research/.
+
+THE REASON THIS IS LOGGED HEAVILY is cost: the edge is real but modest - about
+12 index points a trade net of the 4-point cost, roughly what monthly-option
+spreads and slippage may take. Every exit logs the option premium in and out,
+and every stop exit the index price actually seen. Reproduce:
+backtesting/banknifty-2candle/research/ (harness.py + exp_atr.py).
 
 Note on logging: the strategy host captures stdout to log/strategies/, so
 print() is the logging channel here. That is the host contract and differs
@@ -81,8 +114,25 @@ FO_EXCHANGE = "NFO"
 
 BAR_MINUTES = 3
 SMA_PERIOD = 45
-PRIOR_DAYS = 6                      # calendar days of 1m history for the SMA warm-up
-STOP_BUFFER_PCT = 0.0002            # stop sits this far beyond candle 1
+ATR_PERIOD = 14                     # Wilder ATR on the 3m bars, sizes the stop
+ATR_STOP_MULT = 3.0                 # stop sits this many ATRs beyond the entry
+TARGET_PTS = 100.0                  # index-point target, banked on touch
+DIRECTIONS = ("short",)             # long side removed, see EVIDENCE in the docstring
+
+# LIVE TRADING
+I_UNDERSTAND_THIS_IS_LIVE = True    # False refuses real orders outside analyzer mode
+DRY_RUN = False                     # True resolves and logs the orders, places nothing
+LIVE_BOOK = "plain"                 # which book sends real orders; the other stays paper
+PRODUCT = "MIS"                     # intraday, squared off the same session
+LOTS = 1                            # lots sent per live entry
+BROKER_STOP = True                  # park a resting SL at the broker as a backstop
+BROKER_STOP_IV_POINTS = 2.0         # IV points of vega headroom on that stop
+BROKER_STOP_LIMIT_SLIP = 0.05       # its limit sits this far below the trigger
+TICK = 0.05                         # NFO option tick
+EXIT_RETRY_SECONDS = 20             # minimum gap between retries of a rejected exit
+
+PRIOR_DAYS = 6                      # calendar days of 1m history for the SMA/ATR warm-up
+STOP_BUFFER_PCT = 0.0002            # fallback stop beyond candle 1 while ATR warms
 MAX_TRADES_PER_DAY = 2
 COST_PTS = 4.0                      # assumed round-trip cost in the backtest
 ITM_POINTS = 200                    # paper strike this far in the money
@@ -263,8 +313,20 @@ def fetch_today(client, prior: pd.DataFrame) -> pd.DataFrame:
     bars = bars.copy()
     bars["vwap"] = (typical * volume).cumsum() / cum.where(cum > 0)
     bars.attrs["banks"] = readable
-    closes = pd.concat([prior["close"], bars["close"]]) if prior is not None else bars["close"]
+    if prior is not None and not prior.empty:
+        combined = pd.concat([prior[["high", "low", "close"]], bars[["high", "low", "close"]]])
+    else:
+        combined = bars[["high", "low", "close"]]
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    closes = combined["close"]
     bars["sma"] = closes.rolling(SMA_PERIOD).mean().reindex(bars.index)
+    prev_close = closes.shift(1)
+    tr = pd.concat([
+        combined["high"] - combined["low"],
+        (combined["high"] - prev_close).abs(),
+        (combined["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    bars["atr"] = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean().reindex(bars.index)
     return bars
 
 
@@ -448,11 +510,368 @@ def fresh_day(state: dict, today: str) -> dict:
 
 
 # =============================================================================
-# PAPER POSITIONS  (one per book)
+# LIVE ORDERS
+# =============================================================================
+
+def assert_live_allowed(client) -> bool:
+    """Read the instance's analyzer flag and decide whether trading is allowed.
+
+    Analyzer (sandbox) mode is a global instance flag. Outside it a real order
+    needs I_UNDERSTAND_THIS_IS_LIVE, which the user sets by hand.
+
+    Returns:
+        True when orders may be placed (real, or simulated by the sandbox).
+    """
+    st = None
+    for attempt in range(1, 4):
+        try:
+            st = client.analyzerstatus()
+        except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+            log(f"analyzer status raised {exc!r} (attempt {attempt}/3)")
+            st = None
+        if ok(st):
+            break
+        if attempt < 3:
+            time.sleep(2)
+    if not ok(st):
+        log(f"cannot read analyzer status, refusing to trade: {st}")
+        return False
+    if bool((st.get("data") or {}).get("analyze_mode")):
+        return True
+    if I_UNDERSTAND_THIS_IS_LIVE:
+        log("WARNING: analyzer mode is OFF and live trading was acknowledged")
+        return True
+    log("analyzer mode is OFF and I_UNDERSTAND_THIS_IS_LIVE is False; not trading")
+    return False
+
+
+def send(client, symbol: str, action: str, quantity: int) -> bool:
+    """Place one market order on the option leg.
+
+    Returns:
+        True when the order was accepted (or DRY_RUN swallowed it).
+    """
+    if DRY_RUN:
+        log(f"DRY_RUN {action} {quantity} {symbol}")
+        return True
+    try:
+        r = client.placeorder(strategy=STRATEGY_TAG, symbol=symbol, action=action,
+                              exchange=FO_EXCHANGE, price_type="MARKET",
+                              product=PRODUCT, quantity=quantity)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"order RAISED {action} {quantity} {symbol}: {exc!r}")
+        return False
+    if not ok(r):
+        log(f"order REJECTED {action} {quantity} {symbol}: {r}")
+        return False
+    log(f"order OK {action} {quantity} {symbol} -> {r.get('orderid')}")
+    return True
+
+
+def net_quantity(client, symbol: str) -> int | None:
+    """Net open quantity the broker reports for one option leg.
+
+    Returns:
+        The quantity, 0 when nothing is open, or None when the book cannot be
+        read.
+    """
+    try:
+        r = client.positionbook()
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"positionbook raised {exc!r}")
+        return None
+    if not ok(r):
+        log(f"positionbook failed: {r}")
+        return None
+    for row in r.get("data") or []:
+        if row.get("symbol") == symbol and row.get("exchange") == FO_EXCHANGE:
+            try:
+                return int(float(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                log(f"unreadable quantity on {symbol}: {row.get('quantity')!r}")
+                return None
+    return 0
+
+
+# =============================================================================
+# BROKER-SIDE RESTING STOP
+# =============================================================================
+
+def round_tick(value: float) -> float:
+    """Round down to the exchange tick, cleaning float residue."""
+    return round(max(TICK, int(round(value / TICK, 6)) * TICK), 2)
+
+
+def option_stop_price(client, symbol: str, index_entry: float,
+                      index_stop: float) -> float | None:
+    """Premium level matching the index stop, widened into a disaster stop.
+
+    The index move is mapped to the option with delta and gamma from the
+    broker's Greeks, then the level is pushed further out by theta to
+    square-off and by BROKER_STOP_IV_POINTS of vega, so ordinary decay and IV
+    noise do not fire a stop no index move justified. This is a backstop
+    behind the in-process stop, not a second, tighter one.
+
+    Returns:
+        Trigger rounded to the tick, or None when it cannot be trusted - the
+        caller then places no resting stop and says so.
+    """
+    try:
+        r = client.optiongreeks(symbol=symbol, exchange=FO_EXCHANGE)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"greeks raised {exc!r}; no broker stop for {symbol}")
+        return None
+    if not ok(r):
+        log(f"greeks failed for {symbol}: {r}")
+        return None
+    body = r.get("data") if isinstance(r.get("data"), dict) else r
+    greeks = body.get("greeks") or {}
+    try:
+        delta = float(greeks["delta"])
+        gamma = float(greeks["gamma"])
+        theta = float(greeks["theta"])
+        vega = float(greeks["vega"])
+        entry_premium = float(body["option_price"])
+    except (KeyError, TypeError, ValueError):
+        log(f"greeks unreadable for {symbol}: {body!r}")
+        return None
+    if delta == 0.0:
+        log(f"zero delta for {symbol}; refusing to size a stop off it")
+        return None
+    if entry_premium <= 0:
+        log(f"non-positive premium {entry_premium} for {symbol}")
+        return None
+    move = index_stop - index_entry
+    mirror = entry_premium + delta * move + 0.5 * gamma * move ** 2
+    now = datetime.now(IST)
+    close = now.replace(hour=SQUARE_OFF.hour, minute=SQUARE_OFF.minute,
+                        second=0, microsecond=0)
+    hours = max((close - now).total_seconds() / 3600.0, 0.0)
+    level = mirror - abs(theta) * hours / 24.0 - abs(vega) * BROKER_STOP_IV_POINTS
+    if level <= 0 or level >= entry_premium:
+        log(f"mapped stop {level:.2f} is not below the {entry_premium:.2f} entry "
+            f"premium; no broker stop for {symbol}")
+        return None
+    trigger = round_tick(level)
+    log(f"broker stop for {symbol}: index {index_entry:.2f} -> {index_stop:.2f} "
+        f"({move:+.2f}) maps to {mirror:.2f} on delta {delta:+.4f} gamma "
+        f"{gamma:.6f}; widened to trigger {trigger:.2f}")
+    return trigger
+
+
+def place_broker_stop(client, symbol: str, quantity: int, trigger: float) -> str | None:
+    """Park a stop-limit SELL at the broker to close the long option leg.
+
+    A limit rather than SL-M: NSE restricts market-type stops in F&O, and a
+    rejected SL-M would leave the position silently unprotected. The limit sits
+    BROKER_STOP_LIMIT_SLIP below the trigger so it still fills on a fast move.
+
+    Returns:
+        The broker order id, or None when it was not accepted.
+    """
+    limit = round_tick(trigger * (1.0 - BROKER_STOP_LIMIT_SLIP))
+    if DRY_RUN:
+        log(f"DRY_RUN broker stop: SELL {quantity} {symbol} trigger {trigger:.2f} "
+            f"limit {limit:.2f}")
+        return "DRY"
+    try:
+        r = client.placeorder(
+            strategy=STRATEGY_TAG, symbol=symbol, action="SELL",
+            exchange=FO_EXCHANGE, price_type="SL", product=PRODUCT,
+            quantity=quantity, price=limit, trigger_price=trigger,
+        )
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"broker stop raised {exc!r} for {symbol}")
+        return None
+    if not ok(r):
+        log(f"broker stop REJECTED for {symbol} at trigger {trigger:.2f} "
+            f"limit {limit:.2f}: {r}")
+        return None
+    order_id = r.get("orderid")
+    log(f"broker stop resting: {quantity} {symbol} trigger {trigger:.2f} "
+        f"limit {limit:.2f} -> {order_id}")
+    return order_id
+
+
+def stop_order_state(client, order_id: str) -> str:
+    """Classify a resting stop: 'open', 'filled', 'gone' or 'unknown'."""
+    if not order_id or order_id == "DRY":
+        return "gone"
+    try:
+        r = client.orderstatus(order_id=order_id, strategy=STRATEGY_TAG)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"orderstatus raised {exc!r} for {order_id}")
+        return "unknown"
+    if not ok(r):
+        log(f"orderstatus failed for {order_id}: {r}")
+        return "unknown"
+    data = r.get("data") or r
+    raw = str(data.get("order_status") or data.get("status") or "").lower()
+    if "complete" in raw or "filled" in raw or "executed" in raw:
+        return "filled"
+    if "cancel" in raw or "reject" in raw:
+        return "gone"
+    if raw:
+        return "open"
+    return "unknown"
+
+
+def _cancel_stop(client, order_id: str) -> bool:
+    """Cancel a resting broker stop. True when it is gone."""
+    if not order_id or order_id == "DRY":
+        return True
+    try:
+        return ok(client.cancelorder(order_id=order_id, strategy=STRATEGY_TAG))
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"cancelorder raised {exc!r} for {order_id}")
+        return False
+
+
+def release_broker_stop(client, name: str, book: dict) -> str:
+    """Cancel this position's resting stop before a market exit.
+
+    Returns:
+        'clear' (nothing rests), 'filled' (the stop already closed the
+        position) or 'blocked' (the stop may still be live - do not sell).
+    """
+    pos = book.get("position")
+    if not pos:
+        return "clear"
+    order_id = pos.get("stop_order_id")
+    if not order_id:
+        return "clear"
+    status = stop_order_state(client, order_id)
+    if status == "filled":
+        pos.pop("stop_order_id", None)
+        return "filled"
+    if status == "gone":
+        pos.pop("stop_order_id", None)
+        return "clear"
+    if status == "open":
+        if _cancel_stop(client, order_id):
+            pos.pop("stop_order_id", None)
+            log(f"[{name}] cancelled resting stop {order_id}")
+            return "clear"
+        status = stop_order_state(client, order_id)
+        if status == "filled":
+            pos.pop("stop_order_id", None)
+            return "filled"
+        if status == "gone":
+            pos.pop("stop_order_id", None)
+            return "clear"
+    log(f"[{name}] cannot confirm resting stop {order_id} is gone (status "
+        f"{status}); holding off the exit to avoid a double sell")
+    return "blocked"
+
+
+def drop_resting_stop(client, position: dict, why: str) -> None:
+    """Cancel an orphaned stop whose position is already gone.
+
+    A stop that outlives its position is a live SELL with nothing behind it,
+    which on a fill would open a naked short, so a failure here is shouted
+    rather than swallowed.
+    """
+    order_id = position.pop("stop_order_id", None)
+    if not order_id:
+        return
+    if _cancel_stop(client, order_id):
+        log(f"cancelled orphaned resting stop {order_id}: {why}")
+        return
+    status = stop_order_state(client, order_id)
+    if status in ("filled", "gone"):
+        log(f"orphaned stop {order_id} is already {status}; nothing rests")
+        return
+    log(f"COULD NOT CANCEL resting stop {order_id} ({why}). It may be live with "
+        f"no position behind it - CANCEL IT BY HAND AT THE BROKER")
+
+
+def resting_stop_at_broker(client, symbol: str) -> str | None:
+    """Order id of a stop SELL already resting on this leg, if there is one.
+
+    Checked before a retry so an entry call that timed out AFTER the broker
+    took the order cannot lead to a second resting SELL.
+    """
+    try:
+        r = client.orderbook()
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"orderbook raised {exc!r}")
+        return None
+    if not ok(r):
+        log(f"orderbook failed: {r}")
+        return None
+    data = r.get("data") or {}
+    rows = data.get("orders") if isinstance(data, dict) else data
+    for row in rows or []:
+        status = str(row.get("order_status") or "").lower()
+        if (row.get("symbol") == symbol and row.get("exchange") == FO_EXCHANGE
+                and str(row.get("action") or "").upper() == "SELL"
+                and str(row.get("pricetype") or "").upper() in ("SL", "SL-M")
+                and ("trigger" in status or status == "open")):
+            return str(row.get("orderid"))
+    return None
+
+
+def retry_broker_stop(client, name: str, book: dict, spot: float) -> None:
+    """Park a resting stop on a live position that is still without one."""
+    pos = book.get("position")
+    if not pos or not pos.get("live") or not BROKER_STOP:
+        return
+    symbol = pos["symbol"]
+    existing = resting_stop_at_broker(client, symbol)
+    if existing:
+        pos["stop_order_id"] = existing
+        log(f"[{name}] found resting stop {existing} on {symbol}; adopting it")
+        return
+    stop = float(pos["stop"])
+    long = pos["direction"] == "long"
+    if (spot <= stop) if long else (spot >= stop):
+        return
+    trigger = option_stop_price(client, symbol, spot, stop)
+    order_id = (place_broker_stop(client, symbol, int(pos["qty"]), trigger)
+                if trigger is not None else None)
+    if order_id:
+        pos["stop_order_id"] = order_id
+        log(f"[{name}] broker stop parked on retry for {symbol}")
+    else:
+        log(f"[{name}] STILL NO BROKER STOP on {symbol}; retrying next bar")
+
+
+def abandon_if_flat(client, name: str, book: dict) -> bool:
+    """Clear a live position the broker no longer holds.
+
+    A rejected exit means either the exit order failed (a retry is right) or
+    the position is already gone - squared off by the sandbox or the broker,
+    which also refuse fresh MIS orders after 15:15 IST. Retrying that second
+    case never succeeds, so the position book is the tiebreaker.
+
+    Returns:
+        True when the position was cleared.
+    """
+    pos = book.get("position")
+    if not pos or name != LIVE_BOOK or not pos.get("live"):
+        return False
+    qty = net_quantity(client, pos["symbol"])
+    if qty is None:
+        return False
+    if qty == 0:
+        log(f"[{name}] broker reports no open {pos['symbol']}; it was closed "
+            f"elsewhere - clearing the local position")
+        drop_resting_stop(client, pos, "the position was closed elsewhere")
+        book["position"] = None
+        return True
+    log(f"[{name}] broker still reports {qty} open {pos['symbol']}; keeping the position")
+    return False
+
+
+# =============================================================================
+# POSITIONS  (one per book)
 # =============================================================================
 
 def paper_exit(client, name: str, book: dict, price: float, why: str) -> None:
-    """Close one book's paper position and log index and option results."""
+    """Record a closed position: log the index and option result.
+
+    The order itself is placed by close_position; this only keeps the books.
+    """
     pos = book["position"]
     long = pos["direction"] == "long"
     gross = (price - pos["entry"]) if long else (pos["entry"] - price)
@@ -466,7 +885,8 @@ def paper_exit(client, name: str, book: dict, price: float, why: str) -> None:
     if why == "stop":
         gap = (pos["stop"] - price) if long else (price - pos["stop"])
         slip = f"; stop {pos['stop']:.2f}, seen {price:.2f}, slippage {gap:+.2f} pts"
-    log(f"[{name}] PAPER EXIT {why}: {pos['direction']} {pos['entry']:.2f} -> {price:.2f}, "
+    tag = "LIVE" if pos.get("live") else "PAPER"
+    log(f"[{name}] {tag} EXIT {why}: {pos['direction']} {pos['entry']:.2f} -> {price:.2f}, "
         f"index {gross:+.2f} pts gross, {gross - COST_PTS:+.2f} after {COST_PTS:.0f} cost{slip}{opt}")
     book["closed"].append({"direction": pos["direction"], "entry": pos["entry"], "exit": price,
                            "why": why, "gross": round(gross, 2), "stop": pos["stop"],
@@ -478,24 +898,81 @@ def paper_exit(client, name: str, book: dict, price: float, why: str) -> None:
     book["position"] = None
 
 
+def close_position(client, name: str, book: dict, price: float, why: str) -> bool:
+    """Close one book: send the real exit for the live book, then record it.
+
+    Returns:
+        True when the position is closed (or was already flat), False when the
+        exit was rejected and the position is kept for a later retry.
+    """
+    pos = book.get("position")
+    if not pos:
+        return True
+    if name == LIVE_BOOK and pos.get("live"):
+        # the resting stop may have already closed the position at the broker
+        if pos.get("stop_order_id") and stop_order_state(client, pos["stop_order_id"]) == "filled":
+            log(f"[{name}] resting stop filled; the position is already closed")
+            pos.pop("stop_order_id", None)
+            paper_exit(client, name, book, price, "broker-stop")
+            return True
+        last = pos.get("exit_try_at")
+        now_mono = time.monotonic()
+        if last is not None and now_mono - last < EXIT_RETRY_SECONDS:
+            return False
+        pos["exit_try_at"] = now_mono
+        outcome = release_broker_stop(client, name, book)
+        if outcome == "filled":
+            log(f"[{name}] the resting stop filled during the exit; position closed")
+            paper_exit(client, name, book, price, "broker-stop")
+            return True
+        if outcome == "blocked":
+            return False
+        if not send(client, pos["symbol"], "SELL", pos["qty"]):
+            if abandon_if_flat(client, name, book):
+                return True
+            log(f"[{name}] exit ({why}) order rejected; keeping the position, "
+                f"retrying after {EXIT_RETRY_SECONDS}s")
+            return False
+    paper_exit(client, name, book, price, why)
+    return True
+
+
 def open_books(state: dict) -> list[tuple[str, dict]]:
     return [(n, b) for n, b in state["books"].items() if b.get("position")]
 
 
 def manage(client, name: str, book: dict, bars: pd.DataFrame) -> None:
-    """Catch a stop the poll missed on the last completed bar."""
+    """Reconcile the resting stop, then catch a stop/target the poll missed."""
     pos = book.get("position")
     if not pos:
         return
     long = pos["direction"] == "long"
+    # the resting stop may have closed the position on its own between bars
+    if name == LIVE_BOOK and pos.get("live") and pos.get("stop_order_id"):
+        if stop_order_state(client, pos["stop_order_id"]) == "filled":
+            price = index_ltp(client) or pos["stop"]
+            log(f"[{name}] resting stop {pos['stop_order_id']} filled at the broker")
+            pos.pop("stop_order_id", None)
+            paper_exit(client, name, book, price, "broker-stop")
+            return
     since = bars[bars.index >= pd.Timestamp(pos["entry_bar"])]
     if since.empty:
         return
     last = since.iloc[-1]
-    if (float(last["low"]) <= pos["stop"]) if long else (float(last["high"]) >= pos["stop"]):
+    stop_hit = (float(last["low"]) <= pos["stop"]) if long else (float(last["high"]) >= pos["stop"])
+    target = pos.get("target")
+    target_hit = target is not None and (
+        (float(last["high"]) >= target) if long else (float(last["low"]) <= target))
+    if stop_hit:
         price = index_ltp(client) or pos["stop"]
         log(f"[{name}] bar {since.index[-1]:%H:%M} traded through the stop between polls")
-        paper_exit(client, name, book, price, "stop")
+        close_position(client, name, book, price, "stop")
+    elif target_hit:
+        price = index_ltp(client) or target
+        log(f"[{name}] bar {since.index[-1]:%H:%M} traded through the target between polls")
+        close_position(client, name, book, price, "target")
+    elif name == LIVE_BOOK and pos.get("live") and BROKER_STOP and not pos.get("stop_order_id"):
+        retry_broker_stop(client, name, book, float(last["close"]))
 
 
 def watch_stop(client, state: dict, deadline: float) -> None:
@@ -510,8 +987,15 @@ def watch_stop(client, state: dict, deadline: float) -> None:
         for name, book in open_books(state):
             pos = book["position"]
             long = pos["direction"] == "long"
-            if (price <= pos["stop"]) if long else (price >= pos["stop"]):
-                paper_exit(client, name, book, price, "stop")
+            stop_hit = (price <= pos["stop"]) if long else (price >= pos["stop"])
+            target = pos.get("target")
+            target_hit = target is not None and (
+                (price >= target) if long else (price <= target))
+            if stop_hit:
+                close_position(client, name, book, price, "stop")
+                save_state(state)
+            elif target_hit:
+                close_position(client, name, book, price, "target")
                 save_state(state)
 
 
@@ -530,7 +1014,7 @@ def cycle(client, state: dict) -> dict:
             price = index_ltp(client)
             if price is not None:
                 for name, book in open_now:
-                    paper_exit(client, name, book, price, "square-off")
+                    close_position(client, name, book, price, "square-off")
         return state
 
     prior = fetch_prior(client)
@@ -558,12 +1042,18 @@ def cycle(client, state: dict) -> dict:
     for name, book in books.items():
         if book.get("position"):
             p = book["position"]
-            parts.append(f"{name}: in {p['direction']} from {p['entry']:.2f}, stop {p['stop']:.2f}")
+            tgt = p.get("target")
+            tgt_text = f", target {tgt:.2f}" if tgt is not None else ""
+            parts.append(f"{name}: in {p['direction']} from {p['entry']:.2f}, "
+                         f"stop {p['stop']:.2f}{tgt_text}")
             continue
         if not sig:
             parts.append(f"{name}: flat")
             continue
         side = sig["direction"]
+        if side not in DIRECTIONS:
+            parts.append(f"{name}: {side} pair skipped, only {','.join(DIRECTIONS)} trades")
+            continue
         if book.get("free_from") and sig["c1"].name < pd.Timestamp(book["free_from"]):
             parts.append(f"{name}: {side} pair began before the last exit; not taken")
             continue
@@ -589,23 +1079,47 @@ def cycle(client, state: dict) -> dict:
             log(f"[{name}] decisive day: {reading}")
         long = side == "long"
         spot = index_ltp(client) or float(last["close"])
-        risk = (spot - sig["stop"]) if long else (sig["stop"] - spot)
+        atr = float(last["atr"]) if ("atr" in last and pd.notna(last["atr"])) else float("nan")
+        if atr > 0:
+            stop = spot + ATR_STOP_MULT * atr if long else spot - ATR_STOP_MULT * atr
+        else:
+            stop = sig["stop"]      # candle-1 fallback until the ATR has warmed up
+        target = spot + TARGET_PTS if long else spot - TARGET_PTS
+        risk = abs(spot - stop)
         if risk <= 0:
-            parts.append(f"{name}: {side} pair ignored, index {spot:.2f} already past the stop")
+            parts.append(f"{name}: {side} pair ignored, index {spot:.2f} sits on the stop")
             continue
         leg = resolve_leg(client, "CE" if long else "PE")
+        live = name == LIVE_BOOK
+        if live and leg is None:
+            parts.append(f"{name}: {side} pair skipped, option leg unresolved (live)")
+            continue
+        qty = (leg["lotsize"] * LOTS) if (leg and live) else 0
         premium = option_ltp(client, leg["symbol"]) if leg else None
         shown = f"{premium:.2f}" if premium is not None else "unknown"
-        log(f"[{name}] PAPER {side.upper()}: candles {sig['c1'].name:%H:%M} and {sig['c2'].name:%H:%M} "
-            f"clear of VWAP and SMA{SMA_PERIOD}; entry {spot:.2f}, stop {sig['stop']:.2f} "
-            f"(risk {risk:.2f} pts), held to {SQUARE_OFF:%H:%M}; "
-            f"{leg['symbol'] if leg else 'option unresolved'} premium {shown}")
+        atr_text = f"{atr:.2f}" if atr > 0 else "n/a"
+        if live and not send(client, leg["symbol"], "BUY", qty):
+            parts.append(f"{name}: {side} entry order rejected, not taken")
+            continue
+        stop_order_id = None
+        if live and BROKER_STOP:
+            trigger = option_stop_price(client, leg["symbol"], spot, stop)
+            stop_order_id = (place_broker_stop(client, leg["symbol"], qty, trigger)
+                             if trigger is not None else None)
+            if not stop_order_id:
+                log(f"[{name}] NO BROKER STOP yet on {leg['symbol']}; retried next bar")
+        log(f"[{name}] {'LIVE' if live else 'PAPER'} {side.upper()}: candles "
+            f"{sig['c1'].name:%H:%M} and {sig['c2'].name:%H:%M} clear of VWAP and SMA{SMA_PERIOD}; "
+            f"entry {spot:.2f}, stop {stop:.2f} ({ATR_STOP_MULT:g} x ATR {atr_text}, "
+            f"risk {risk:.2f} pts), target {target:.2f}, held to {SQUARE_OFF:%H:%M}; "
+            f"{leg['symbol'] if leg else 'option unresolved'} x{qty} premium {shown}")
         book["trades"] += 1
         book["position"] = {
-            "direction": side, "entry": spot, "stop": sig["stop"], "risk": risk,
+            "direction": side, "entry": spot, "stop": stop, "target": target, "risk": risk,
             "opened": now.isoformat(), "entry_bar": (bar + timedelta(minutes=BAR_MINUTES)).isoformat(),
-            "symbol": leg["symbol"] if leg else None,
-            "lotsize": leg["lotsize"] if leg else 0, "premium_in": premium,
+            "symbol": leg["symbol"] if leg else None, "qty": qty,
+            "lotsize": leg["lotsize"] if leg else 0, "live": live, "premium_in": premium,
+            "stop_order_id": stop_order_id,
         }
         parts.append(f"{name}: entered {side}")
     if banks < len(VOLUME_CONSTITUENTS):
@@ -631,10 +1145,10 @@ def summary(state: dict) -> None:
     for name, book in state.get("books", {}).items():
         closed = book.get("closed") or []
         if not closed:
-            log(f"[{name}] day summary: no paper trades")
+            log(f"[{name}] day summary: no trades")
             continue
         gross = sum(t["gross"] for t in closed)
-        log(f"[{name}] day summary: {len(closed)} paper trades, index {gross:+.2f} pts gross, "
+        log(f"[{name}] day summary: {len(closed)} trades, index {gross:+.2f} pts gross, "
             f"{gross - COST_PTS * len(closed):+.2f} after cost")
 
 
@@ -643,11 +1157,17 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     client = build_client()
-    log(f"{STRATEGY_TAG} starting, PAPER ONLY - no order is ever sent: {BAR_MINUTES}m two-candle "
-        f"VWAP+SMA{SMA_PERIOD}, stop {STOP_BUFFER_PCT:.2%} beyond candle 1, no target, entries "
-        f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY} a day, "
-        f"square-off {SQUARE_OFF:%H:%M}; books: plain, breadth ({len(BREADTH_CONSTITUENTS)} banks "
-        f">= {BREADTH_MIN:g}x either way); option {ITM_POINTS} pts ITM")
+    if not assert_live_allowed(client):
+        log("live trading is not permitted by the analyzer setting; exiting")
+        return 1
+    mode = ("DRY_RUN, no orders" if DRY_RUN
+            else f"LIVE, the {LIVE_BOOK} book places real orders")
+    log(f"{STRATEGY_TAG} starting, {mode}: {BAR_MINUTES}m two-candle VWAP+SMA{SMA_PERIOD}, "
+        f"directions {','.join(DIRECTIONS)}, stop {ATR_STOP_MULT:g} x ATR{ATR_PERIOD}, "
+        f"target {TARGET_PTS:g} pts, entries {NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, "
+        f"max {MAX_TRADES_PER_DAY} a day, square-off {SQUARE_OFF:%H:%M}; books: plain, breadth "
+        f"({len(BREADTH_CONSTITUENTS)} banks >= {BREADTH_MIN:g}x either way); option {ITM_POINTS} pts ITM; "
+        f"broker stop {'ON' if BROKER_STOP else 'OFF'}")
 
     state = load_state()
     try:
