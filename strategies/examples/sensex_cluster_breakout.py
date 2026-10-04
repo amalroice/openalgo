@@ -59,6 +59,22 @@ trades win once real stop slippage is paid. ATR is Wilder's (EWM alpha 1/14)
 over the true range, carried across days, warmed on ATR_WARMUP_DAYS prior
 sessions fetched once a day, as the backtest computes it.
 
+2026-10-04: BOX_ATR_MAX 2.0 -> 3.0 and TRAIL_STEP_PCT 0.1% -> 0.2%, replayed
+on the 650-session gated window (2024-01-08..2026-09-15, 10 pts a trade):
+
+                  trades  win%   net pts    avg     PF   PF@20
+    old (2.0/0.1%)   292  44.2    20,254   69.4   1.72   1.59
+    new (3.0/0.2%)   323  48.3    30,760   95.2   1.96   1.81
+
+    By year (new): 2024 51.8% PF 2.29, 2025 40.8% PF 1.52, 2026 51.8% PF
+    1.99 - the newest year, which the change was not fitted on, is the best
+    of the three. The cap is a plateau: 2.25/2.5/2.75/3.0/3.25/3.5 gave PF
+    1.77/1.85/1.87/1.93/1.84/1.85, and 0.2% is the trail step the NIFTY book
+    has run all along. Profit targets were tried and dropped - R and fixed
+    targets lifted win rate to 47-51% but cut PF to 1.29-1.55 by capping the
+    rides to square-off that carry this book. Reproduce:
+    backtesting/sensex_cluster/research/ (harness.py + exp_refine.py).
+
 A vix14 book (same filter, VIX floor 14) ran 2026-09-28..29 and was dropped at
 the user's call: the VIX floor is 13 only.
 
@@ -118,7 +134,7 @@ INTERVAL = "5m"
 MIN_CANDLES = 4                     # cluster length before a breakout counts
 BOX_PCT = 0.0025                    # box height as a fraction of price (0.25%)
 TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
-TRAIL_STEP_PCT = 0.001              # the stop moves once per step of this size
+TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
 MAX_TRADES_PER_DAY = 2
 BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points at every level tested
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
@@ -143,7 +159,7 @@ BREADTH_MIN = 2.0
 # VIX floor per gated book; every book not listed here is ungated.
 BOOK_VIX_MIN = {"boxatr": VIX_MIN}
 # Box height cap in ATR(14) multiples, per book; books not listed have none.
-BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
+BOOK_BOX_ATR_MAX = {"boxatr": 3.0}
 ATR_PERIOD = 14
 ATR_WARMUP_DAYS = 10                # calendar days of prior bars for the ATR
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
