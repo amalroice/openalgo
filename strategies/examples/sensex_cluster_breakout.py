@@ -2,19 +2,29 @@
 
 Live from 2026-10-03: with TRADE_LIVE the script sends real orders - a market
 BUY of LIVE_LOTS of the weekly BFO option ITM_POINTS (100) in the money - CE
-below ATM, PE above; ATM until 2026-09-29 - on the signal, a broker-side SL-M
-backstop sized off the index stop, and market SELL exits when the index poll
-or a bar touches the stop, on the trail, and at the 15:00 square-off. Every
-exit cancels the backstop first, so a backstop firing mid-exit is detected
-instead of sold twice. TRADE_LIVE = False returns every path to the old paper
-record: premiums quoted, no order ever sent. Orders follow the platform's
-Analyze (sandbox) versus Live mode, so the same script can be dry run on the
-sandbox before real money is at risk. Exit failures are retried, never
-assumed flat.
+below ATM, PE above; ATM until 2026-09-29. Once the option BUY fills, the
+script reads that contract's broker Greeks, maps the initial index stop to an
+option premium trigger, and immediately parks a broker-side SL-M backstop.
+Market SELL exits handle index polls or bars touching the stop, the trail,
+and the 15:00 square-off. Every exit cancels the backstop first, so a backstop
+firing mid-exit is detected instead of sold twice. If Greeks are unavailable
+or the broker does not confirm the stop, the filled option is immediately
+flattened; an unsettled flatten stays in emergency-exit retries. TRADE_LIVE =
+False returns every path to the old paper record: premiums quoted, no order
+ever sent. Orders follow the platform's Analyze (sandbox) versus Live mode,
+so the same script can be dry run on the sandbox before real money is at risk.
+Exit failures are retried, never assumed flat.
 
 There is no target: winners ride to the square-off on the trail, losers are
-cut at the box stop, and every exit logs the index slippage against the stop
-plus, live, the option fill against the premium quoted at entry.
+cut at the tighter box-edge or 2.5xATR initial index stop. Every exit logs
+index slippage against the stop and, for live positions, the option fill
+against the premium quoted at entry.
+
+The broker trigger projects from the actual option fill using delta and gamma
+for the index move to the stop, subtracts theta decay through square-off and a
+2-vol-point vega buffer, then rounds down to the BFO 0.05 tick. The ATR cap
+only tightens the box-edge stop: long max(box low, entry - 2.5 x ATR(14));
+short min(box high, entry + 2.5 x ATR(14)).
 
 Rule (long; short is the mirror):
     1. Cluster: at least MIN_CANDLES consecutive completed candles that all fit
@@ -24,9 +34,11 @@ Rule (long; short is the mirror):
     2. Signal: the first candle that CLOSES above the box (short: below it).
     3. Entry: at the next bar's open - here, the index price when the signal
        candle has just completed.
-    4. Stop: the opposite side of the box.
+    4. Initial index stop: the tighter of the opposite box edge and
+       MAX_INITIAL_RISK_ATR (2.5) x ATR(14) from entry. The live option stop
+       is mapped from that index level using the bought option's Greeks.
     5. Trail: the stop sits TRAIL_DIST_PCT of the entry behind the best price,
-       moved in TRAIL_STEP_PCT steps, never looser than the box stop.
+       moved in TRAIL_STEP_PCT steps, never loosening the initial stop.
        Breakeven: OFF (BREAKEVEN_AT_PTS = None). When set, once the best
        move reaches that many index points the stop is never worse than the
        entry. Every level from 40 to 160 lost points over 10y.
@@ -147,9 +159,9 @@ LIVE_LOTS = 1                       # lots per entry; quantity = lots x lotsize
 LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
 ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
 ORDER_POLL_SECONDS = 1
-SLM_DELTA = 0.95                    # assumed option points per index point (backstop sizing)
-SLM_BUFFER_PCT = 0.01               # backstop sits this far below the paper-exit premium
-SLM_TICK = 0.05                     # index option price tick
+MAX_INITIAL_RISK_ATR = 2.5          # cap initial index risk, never widen past the box edge
+SLM_IV_BUFFER_POINTS = 2.0          # Greek-mapped backstop headroom for IV movement
+SLM_TICK = 0.05                     # BFO option price tick
 
 # Active-day filter for the gated books. VIX_MIN sits on the 13-14 plateau
 # of the in-sample sweep, BREADTH_MIN on the 2.0-2.5 plateau. None switches
@@ -474,6 +486,17 @@ def scan(frame: pd.DataFrame, start: int) -> tuple[dict | None, dict | None]:
     return None, None
 
 
+def initial_index_stop(entry: float, box_low: float, box_high: float,
+                       atr: float, long: bool) -> float:
+    """Cap index risk at MAX_INITIAL_RISK_ATR without widening the box stop."""
+    if not math.isfinite(atr) or atr <= 0:
+        raise ValueError("ATR must be finite and positive to calculate the initial stop")
+    max_risk = MAX_INITIAL_RISK_ATR * atr
+    if long:
+        return max(box_low, entry - max_risk)
+    return min(box_high, entry + max_risk)
+
+
 def trail_level(entry: float, mfe: float, long: bool) -> float | None:
     """Trailing stop for a best excursion of mfe points, in whole steps."""
     steps = int(mfe // (TRAIL_STEP_PCT * entry))
@@ -632,20 +655,70 @@ def wait_order(client, orderid: str) -> tuple[str, float | None]:
     return status, None
 
 
-def slm_trigger(premium_in: float, risk_pts: float) -> float | None:
-    """Backstop trigger for the option leg, or None when it prices below a tick.
-
-    The stop is an INDEX level but the SL-M must be an OPTION price: assume
-    the premium moves SLM_DELTA points per index point (deep-ITM weekly, so
-    most of the move) and sit SLM_BUFFER_PCT below the paper-exit premium, so
-    the backstop only fires for a move the index poll did not take - a dead
-    script or a gap through the stop. Firing early would front-run the
-    strategy's own exit, which is why the bias is late, never exact.
-    """
-    raw = premium_in * (1 - SLM_BUFFER_PCT) - SLM_DELTA * risk_pts
-    if raw < SLM_TICK:
+def greek_mapped_slm_trigger(premium_in: float, delta: float, gamma: float,
+                             theta: float, vega: float, index_move: float,
+                             hours_to_square_off: float) -> float | None:
+    """Project the option stop premium from broker Greeks and round to BFO ticks."""
+    try:
+        values = tuple(float(value) for value in (
+            premium_in, delta, gamma, theta, vega, index_move, hours_to_square_off,
+        ))
+    except (TypeError, ValueError):
         return None
-    return math.floor(raw / SLM_TICK) * SLM_TICK
+    if not all(math.isfinite(value) for value in values):
+        return None
+    premium_in, delta, gamma, theta, vega, index_move, hours_to_square_off = values
+    if premium_in <= 0 or delta == 0 or hours_to_square_off < 0:
+        return None
+    projected = premium_in + delta * index_move + 0.5 * gamma * index_move**2
+    theta_buffer = abs(theta) * hours_to_square_off / 24.0
+    vega_buffer = abs(vega) * SLM_IV_BUFFER_POINTS
+    level = projected - theta_buffer - vega_buffer
+    if level <= 0 or level >= premium_in:
+        return None
+    trigger = round(math.floor(level / SLM_TICK) * SLM_TICK, 2)
+    return trigger if trigger >= SLM_TICK else None
+
+
+def slm_trigger(client, symbol: str, premium_in: float,
+                index_entry: float, index_stop: float) -> float | None:
+    """Fetch the filled option's Greeks and map the index stop to its premium."""
+    try:
+        response = client.optiongreeks(symbol=symbol, exchange=FO_EXCHANGE)
+    except Exception as exc:  # noqa: BLE001 - entry handling will flatten on failure
+        log(f"option Greeks raised {exc!r}; no broker SL-M for {symbol}")
+        return None
+    if not ok(response):
+        log(f"option Greeks failed for {symbol}: {response}")
+        return None
+    body = response.get("data") if isinstance(response.get("data"), dict) else response
+    greeks = body.get("greeks") or {}
+    try:
+        delta, gamma = float(greeks["delta"]), float(greeks["gamma"])
+        theta, vega = float(greeks["theta"]), float(greeks["vega"])
+    except (KeyError, TypeError, ValueError):
+        log(f"option Greeks unreadable for {symbol}: {body!r}")
+        return None
+    now = datetime.now(IST)
+    close = now.replace(hour=SQUARE_OFF.hour, minute=SQUARE_OFF.minute, second=0, microsecond=0)
+    hours = max((close - now).total_seconds() / 3600.0, 0.0)
+    move = index_stop - index_entry
+    trigger = greek_mapped_slm_trigger(premium_in, delta, gamma, theta, vega, move, hours)
+    if trigger is None:
+        log(f"Greek-mapped stop invalid for {symbol}; no broker stop")
+        return None
+    log(f"Greek-mapped stop {symbol}: index {index_entry:.2f}->{index_stop:.2f}, "
+        f"delta {delta:+.4f}, gamma {gamma:.6f}, theta {theta:.4f}, vega {vega:.4f}; "
+        f"SL-M trigger {trigger:.2f}")
+    return trigger
+
+
+def flatten_unprotected_entry(client, symbol: str, quantity: int, buy_orderid: str) -> bool:
+    """Immediately flatten a filled option if its broker-side stop is not confirmed."""
+    log(f"no confirmed broker stop; flattening {symbol} x{quantity}")
+    how, _premium = live_close(client, {"symbol": symbol, "qty": quantity,
+                                       "buy_orderid": buy_orderid, "slm_orderid": None})
+    return how in ("closed", "already-flat")
 
 
 def live_entry(client, leg: dict, spot: float, stop: float) -> dict | None:
@@ -681,29 +754,45 @@ def live_entry(client, leg: dict, spot: float, stop: float) -> dict | None:
         return None
     if not fill:
         fill = option_ltp(client, leg["symbol"])
-    trigger = slm_trigger(fill, abs(spot - stop)) if fill else None
+    filled_spot = index_ltp(client) or spot
+    long = stop < spot
+    if (filled_spot <= stop) if long else (filled_spot >= stop):
+        trigger = None
+    else:
+        trigger = slm_trigger(client, leg["symbol"], fill, filled_spot, stop) if fill else None
     slm_id = None
     shown = fill if fill else "unknown"
     if trigger is None:
-        log(f"LIVE entry {orderid}: filled {shown} x{qty}, no usable SL-M backstop "
-            "(premium too close to the risk) - the index poll is the only exit")
-    else:
-        try:
-            sr = client.placeorder(strategy=STRATEGY_TAG, symbol=leg["symbol"], action="SELL",
-                                   exchange=FO_EXCHANGE, price_type="SL-M",
-                                   product=LIVE_PRODUCT, quantity=qty,
-                                   trigger_price=f"{trigger:.2f}")
-        except Exception as exc:  # noqa: BLE001 - the index poll still exits
-            log(f"LIVE entry {orderid}: filled {shown} x{qty}, SL-M raised {exc!r}; "
-                "index poll is the only exit")
-            sr = None
-        if ok(sr):
-            slm_id = str(sr.get("orderid") or "")
-            log(f"LIVE entry {orderid}: filled {shown} x{qty}, SL-M backstop "
-                f"{trigger:.2f} (order {slm_id})")
-        elif sr is not None:
-            log(f"LIVE entry {orderid}: filled {shown} x{qty}, SL-M NOT placed ({sr}); "
-                "index poll is the only exit")
+        flattened = flatten_unprotected_entry(client, leg["symbol"], qty, orderid)
+        if flattened:
+            return None
+        log(f"CRITICAL: unprotected fill {leg['symbol']} remains open; retrying exit on each poll")
+        return {"buy_orderid": orderid, "slm_orderid": None, "slm_trigger": None,
+                "premium_in": fill, "qty": qty, "emergency_exit": True}
+    try:
+        sr = client.placeorder(strategy=STRATEGY_TAG, symbol=leg["symbol"], action="SELL",
+                               exchange=FO_EXCHANGE, price_type="SL-M",
+                               product=LIVE_PRODUCT, quantity=qty,
+                               trigger_price=f"{trigger:.2f}")
+    except Exception as exc:  # noqa: BLE001 - entry is filled; flatten if stop placement fails
+        log(f"LIVE entry {orderid}: SL-M raised {exc!r} for {leg['symbol']}")
+        sr = None
+    if not ok(sr):
+        log(f"LIVE entry {orderid}: broker did not confirm SL-M for {leg['symbol']}: {sr}")
+        if flatten_unprotected_entry(client, leg["symbol"], qty, orderid):
+            return None
+        log(f"CRITICAL: unprotected fill {leg['symbol']} remains open; retrying exit on each poll")
+        return {"buy_orderid": orderid, "slm_orderid": None, "slm_trigger": trigger,
+                "premium_in": fill, "qty": qty, "emergency_exit": True}
+    slm_id = str(sr.get("orderid") or "") if ok(sr) else ""
+    if not slm_id:
+        log(f"LIVE entry {orderid}: broker did not return an SL-M order id for {leg['symbol']}")
+        if flatten_unprotected_entry(client, leg["symbol"], qty, orderid):
+            return None
+        return {"buy_orderid": orderid, "slm_orderid": None, "slm_trigger": trigger,
+                "premium_in": fill, "qty": qty, "emergency_exit": True}
+    log(f"LIVE entry {orderid}: filled {shown} x{qty}, Greeks-mapped SL-M "
+        f"{trigger:.2f} (order {slm_id})")
     return {"buy_orderid": orderid, "slm_orderid": slm_id,
             "slm_trigger": trigger, "premium_in": fill, "qty": qty}
 
@@ -816,9 +905,13 @@ def next_bar_start(stamp: datetime) -> str:
 
 
 def manage(client, name: str, book: dict, frame: pd.DataFrame) -> None:
-    """Catch a stop the poll missed, then ratchet the trail on completed bars."""
+    """Catch stops, retry an unprotected emergency exit, then ratchet the trail."""
     pos = book.get("position")
     if not pos:
+        return
+    if pos.get("emergency_exit"):
+        close_position(client, name, book, index_ltp(client) or pos["entry"],
+                       "unprotected-entry", next_bar_start(datetime.now(IST)))
         return
     long = pos["direction"] == "long"
     since = frame[frame.index >= pd.Timestamp(pos["entry_bar"])]
@@ -852,7 +945,7 @@ def open_books(state: dict) -> list[tuple[str, dict]]:
 
 
 def watch_stop(client, state: dict, deadline: float) -> None:
-    """Poll the index between bars and paper-exit any book whose stop trades."""
+    """Poll index stops; the broker SL-M remains the live outage backstop."""
     while not _shutdown and time.monotonic() + STOP_POLL_SECONDS < deadline:
         if not open_books(state) or datetime.now(IST).time() >= SQUARE_OFF:
             return
@@ -862,6 +955,11 @@ def watch_stop(client, state: dict, deadline: float) -> None:
             continue
         for name, book in open_books(state):
             pos = book["position"]
+            if pos.get("emergency_exit"):
+                close_position(client, name, book, price, "unprotected-entry",
+                               next_bar_start(datetime.now(IST)))
+                save_state(state)
+                continue
             long = pos["direction"] == "long"
             if (price <= pos["stop"]) if long else (price >= pos["stop"]):
                 close_position(client, name, book, price, "stop", next_bar_start(datetime.now(IST)))
@@ -956,8 +1054,11 @@ def cycle(client, state: dict) -> dict:
                 log(f"[{name}] {side} breakout skipped, not an active day: {reading}{would}")
                 continue
             log(f"[{name}] active day: {reading}")
+        atr = gate_quotes.get("atr")
+        if atr is None or not math.isfinite(float(atr)) or atr <= 0:
+            log(f"[{name}] {side} breakout skipped: ATR unreadable, initial stop cannot be calculated")
+            continue
         if name in BOOK_BOX_ATR_MAX:
-            atr = gate_quotes["atr"]
             box = sig["high"] - sig["low"]
             cap = BOOK_BOX_ATR_MAX[name]
             if atr is None:
@@ -972,7 +1073,7 @@ def cycle(client, state: dict) -> dict:
         if "spot" not in legs:
             legs["spot"] = index_ltp(client) or close
         spot = legs["spot"]
-        stop = sig["low"] if long else sig["high"]
+        stop = initial_index_stop(spot, sig["low"], sig["high"], atr, long)
         risk = (spot - stop) if long else (stop - spot)
         if risk <= 0:
             log(f"[{name}] {side} breakout ignored: index {spot:.2f} already back past the stop")
@@ -1051,7 +1152,8 @@ def main() -> int:
             "backstop, exit failures retried (Analyze mode routes them to the sandbox); "
             "TRADE_LIVE = False is paper") if TRADE_LIVE else "PAPER ONLY - no order is ever sent"
     log(f"{STRATEGY_TAG} starting, {mode}: "
-        f">= {MIN_CANDLES} candles in a {BOX_PCT:.2%} box, stop at the far side, "
+        f">= {MIN_CANDLES} candles in a {BOX_PCT:.2%} box, stop at the tighter box edge or "
+        f"{MAX_INITIAL_RISK_ATR:g}x ATR{ATR_PERIOD}, "
         f"trail {TRAIL_DIST_PCT:.1%} in {TRAIL_STEP_PCT:.1%} steps, {be_text}, entries "
         f"{NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, max {MAX_TRADES_PER_DAY}, "
         f"square-off {SQUARE_OFF:%H:%M}")

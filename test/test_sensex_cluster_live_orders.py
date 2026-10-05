@@ -9,8 +9,10 @@ keeps the position for a retry instead of assuming flat.
 from __future__ import annotations
 
 import importlib.util
+import math
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 MODULE_PATH = (Path(__file__).resolve().parents[1]
@@ -34,11 +36,15 @@ class StubClient:
         self.slm_ok = slm_ok
         self.slm_status = slm_status
         self.cancel_ok = cancel_ok
+        self.greeks_ok = True
+        self.index_price = 75000.0
+        self.events: list[str] = []
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
         self._n = 0
 
     def placeorder(self, **kw):
+        self.events.append(f"place:{kw['action']}:{kw['price_type']}")
         self._n += 1
         kind = "SLM" if kw["price_type"] == "SL-M" else kw["action"]
         if kind == "BUY" and not self.buy_ok:
@@ -50,6 +56,7 @@ class StubClient:
         return {"status": "success", "orderid": orderid}
 
     def orderstatus(self, *, order_id, strategy="Python", **kw):
+        self.events.append(f"status:{order_id}")
         if order_id.startswith("SLM"):
             state, price = self.slm_status
         elif order_id.startswith("BUY"):
@@ -58,6 +65,18 @@ class StubClient:
             state, price = self.sell_status
         return {"status": "success",
                 "data": {"order_status": state, "average_price": price}}
+
+    def quotes(self, *, symbol, exchange, **kw):
+        if symbol == scb.UNDERLYING and exchange == scb.INDEX_EXCHANGE:
+            return {"status": "success", "data": {"ltp": self.index_price}}
+        return {"status": "error", "message": "quote unavailable"}
+
+    def optiongreeks(self, *, symbol, exchange, **kw):
+        self.events.append(f"greeks:{symbol}:{exchange}")
+        if not self.greeks_ok:
+            return {"status": "error", "message": "Greeks unavailable"}
+        return {"status": "success", "option_price": 400.0,
+                "greeks": {"delta": 0.8, "gamma": 0.0, "theta": 0.0, "vega": 0.0}}
 
     def cancelorder(self, *, order_id, strategy="Python", **kw):
         if self.cancel_ok or order_id.startswith(("BUY", "SELL")):
@@ -78,13 +97,24 @@ def placed(client, kind, price_type):
             if o["action"] == kind and o["price_type"] == price_type]
 
 
-def test_slm_trigger_ticks_down_below_the_paper_exit_price():
-    trigger = scb.slm_trigger(400.0, 150.0)
-    paper_exit = 400.0 * (1 - scb.SLM_BUFFER_PCT) - 0.8 * 150.0  # any real delta < the assumption
-    assert trigger is not None
-    assert trigger < paper_exit                       # backstop must not front-run the exit
-    assert abs(trigger / scb.SLM_TICK - round(trigger / scb.SLM_TICK)) < 1e-9
-    assert scb.slm_trigger(120.0, 500.0) is None      # premium too close to the risk
+def test_greek_mapped_trigger_uses_option_greeks_and_tick_rounding():
+    trigger = scb.greek_mapped_slm_trigger(400.0, 0.8, 0.0001, -4.0, 10.0, -100.0, 6.0)
+    projected = 400.0 - 80.0 + 0.5 * 0.0001 * 100.0**2
+    expected = projected - 4.0 * 6.0 / 24.0 - 10.0 * scb.SLM_IV_BUFFER_POINTS
+    assert trigger == pytest.approx(math.floor(expected / scb.SLM_TICK) * scb.SLM_TICK)
+    assert trigger < 400.0
+    assert scb.greek_mapped_slm_trigger(100.0, 0.8, 0.0, 0.0, 0.0, -200.0, 0.0) is None
+    assert scb.greek_mapped_slm_trigger(400.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0) is None
+    assert scb.greek_mapped_slm_trigger(1.0, 0.8, 0.0, 0.0, 0.0, -2.0, 0.0) is None
+
+
+def test_initial_index_stop_caps_risk_and_keeps_tighter_box_edge():
+    assert scb.initial_index_stop(75100.0, 74800.0, 75300.0, 100.0, True) == 74850.0
+    assert scb.initial_index_stop(74900.0, 74700.0, 75200.0, 100.0, False) == 75150.0
+    assert scb.initial_index_stop(75100.0, 74900.0, 75150.0, 100.0, True) == 74900.0
+    assert scb.initial_index_stop(74900.0, 74850.0, 75000.0, 100.0, False) == 75000.0
+    with pytest.raises(ValueError, match="ATR must be finite and positive"):
+        scb.initial_index_stop(75000.0, 74900.0, 75100.0, float("nan"), True)
 
 
 def test_live_entry_fills_then_parks_the_backstop():
@@ -98,9 +128,51 @@ def test_live_entry_fills_then_parks_the_backstop():
     # the buy is placed first, the SL-M only after the fill is read
     assert client.orders[0]["action"] == "BUY"
     slm = placed(client, "SELL", "SL-M")[0]
-    expected = scb.slm_trigger(412.5, abs(75000.0 - 74850.0))
-    assert slm["trigger_price"] == f"{expected:.2f}"
+    assert slm["trigger_price"] == "292.50"  # fill 412.5 less 0.8 delta x 150 index points
     assert slm["quantity"] == LEG["lotsize"]
+    assert client.events.index("status:BUY1") < client.events.index(f"greeks:{LEG['symbol']}:BFO")
+    assert client.events.index(f"greeks:{LEG['symbol']}:BFO") < client.events.index("place:SELL:SL-M")
+
+
+def test_initial_index_stop_rejects_unusable_atr():
+    with pytest.raises(ValueError, match="ATR must be finite and positive"):
+        scb.initial_index_stop(75000.0, 74900.0, 75100.0, 0.0, True)
+
+
+def test_live_entry_flattens_if_stop_is_crossed_during_buy():
+    client = StubClient()
+    client.index_price = 74840.0
+    assert scb.live_entry(client, LEG, spot=75000.0, stop=74850.0) is None
+    assert len(placed(client, "SELL", "MARKET")) == 1
+
+
+def test_live_entry_flattens_when_greeks_are_unavailable():
+    client = StubClient()
+    client.greeks_ok = False
+    assert scb.live_entry(client, LEG, spot=75000.0, stop=74850.0) is None
+    assert len(placed(client, "SELL", "MARKET")) == 1
+    assert placed(client, "SELL", "SL-M") == []
+
+
+def test_live_entry_flattens_when_broker_rejects_stop():
+    client = StubClient(slm_ok=False)
+    assert scb.live_entry(client, LEG, spot=75000.0, stop=74850.0) is None
+    assert len(placed(client, "SELL", "MARKET")) == 1
+
+
+def test_live_entry_marks_unsettled_emergency_flatten_for_retries(monkeypatch):
+    monkeypatch.setattr(scb, "index_ltp", lambda _client: 75000.0)
+    client = StubClient(slm_ok=False, sell_status=("open", 0.0))
+    fills = scb.live_entry(client, LEG, spot=75000.0, stop=74850.0)
+    assert fills is not None
+    assert fills["emergency_exit"] is True
+    book = {"position": {"direction": "long", "entry": 75000.0,
+                          "stop": 74850.0, "entry_bar": "2026-10-05T10:00:00+05:30",
+                          "symbol": LEG["symbol"], "buy_orderid": fills["buy_orderid"],
+                          "qty": LEG["lotsize"], "slm_orderid": None,
+                          "emergency_exit": True}}
+    scb.manage(client, "boxatr", book, pd.DataFrame())
+    assert book["position"] is not None
 
 
 def test_live_entry_rejected_buy_drops_the_signal():
