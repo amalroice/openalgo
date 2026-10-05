@@ -1081,7 +1081,7 @@ def cycle(client, state: dict) -> dict:
         spot = index_ltp(client) or float(last["close"])
         atr = float(last["atr"]) if ("atr" in last and pd.notna(last["atr"])) else float("nan")
         if atr > 0:
-            stop = spot + ATR_STOP_MULT * atr if long else spot - ATR_STOP_MULT * atr
+            stop = spot - ATR_STOP_MULT * atr if long else spot + ATR_STOP_MULT * atr
         else:
             stop = sig["stop"]      # candle-1 fallback until the ATR has warmed up
         target = spot + TARGET_PTS if long else spot - TARGET_PTS
