@@ -60,7 +60,13 @@ Stop:
     inert and converges on doing nothing. Tightening pushes the stop-out rate
     back toward the 51.8% this buffer was introduced to escape. Do not retry it.
 
-Management (1 lot):
+Management (2 lots, split - from 2026-11-02):
+    lock lot   once the trade has run BREAKEVEN_AT_PTS (25) points, its stop
+               is never worse than entry + BREAKEVEN_LOCK_PTS (15).
+    runner     RUNNER_LOTS (1) lot whose stop only goes to entry +
+               RUNNER_LOCK_PTS (0) at the same point, so it can ride the
+               trail to the square-off. Each lot exits on its own stop; the
+               broker backstop always covers exactly the lots still open.
     target     OFF (TARGET_R = None). When set, the whole position is sold
                the moment the index trades TARGET_R times R past the entry, R
                being the entry less candle 1's low. Backtests badly; see there.
@@ -138,7 +144,16 @@ SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
 ITM_POINTS = 100                    # strike this far in the money (CE below ATM, PE above); was ATM until 2026-09-29
-LOTS = 1                            # cut from 2 on 2026-09-20 for the first live week
+LOTS = 2                            # 1 until 2026-10-30; 2 from 2026-11-02 for the lock/runner split
+# Two-lot split, user's request 2026-10-30: one lot locks profit, the other
+# only goes to breakeven and rides the trail. Replayed on the 2026-11-02 rules
+# (no breadth gate, lock at +25), 3 pts a lot, 2026-01..10-30:
+#     both lots lock +15      +1,830 pts  (Rs 1.19L)
+#     lock + breakeven runner +1,967 pts  (Rs 1.28L)  PF 1.40, win 59%, maxDD -37k
+# Last 2y +3,912 pts PF 1.33; ten years +1,551 pts PF 1.03 (2017-19, 2022,
+# 2023 lose). Reproduce: session bb9420a2 scratchpad nf_twolot.py.
+RUNNER_LOTS = 1                     # of LOTS, these only go to breakeven; 0 locks every lot
+RUNNER_LOCK_PTS = 0.0               # the runner's floor once BREAKEVEN_AT_PTS is reached
 
 # Percent trailing stop, replacing 1-lot booking at +1.5R (+1R when the stop was
 # over 30 pts) and the line trail on 2026-09-18. With nothing booked, the
@@ -1452,7 +1467,7 @@ def closed_outside(client, state: dict) -> bool:
             f"it. CHECK THE BROKER POSITION BY HAND")
         state["position"] = None
         return True
-    position["lots_open"] = lots_left
+    shrink_legs(position, lots_left)
     return False
 
 
@@ -1866,6 +1881,126 @@ def fresh_day(state: dict, today: str) -> dict:
 # MANAGEMENT
 # =============================================================================
 
+def initial_legs(stop: float) -> dict:
+    """The lock and runner legs of a fresh position, both on the entry stop."""
+    runner = max(0, min(RUNNER_LOTS, LOTS))
+    legs = {}
+    if LOTS - runner > 0:
+        legs["lock"] = {"lots": LOTS - runner, "stop": stop}
+    if runner > 0:
+        legs["runner"] = {"lots": runner, "stop": stop}
+    return legs
+
+
+def position_legs(position: dict) -> dict:
+    """The position's legs; a position saved before the split is one lock leg."""
+    if not position.get("legs"):
+        position["legs"] = {"lock": {"lots": int(position["lots_open"]),
+                                     "stop": float(position["stop"])}}
+    return position["legs"]
+
+
+def sync_position(position: dict) -> None:
+    """Total the open lots and set the position stop to the loosest leg's.
+
+    The broker backstop mirrors position["stop"], so it must be the stop of
+    the leg with the most room - a backstop tighter than a leg's own stop
+    would sell that leg early.
+    """
+    legs = position_legs(position)
+    long = position["direction"] == "long"
+    stops = [float(leg["stop"]) for leg in legs.values()]
+    position["lots_open"] = sum(int(leg["lots"]) for leg in legs.values())
+    if stops:
+        position["stop"] = min(stops) if long else max(stops)
+
+
+def shrink_legs(position: dict, lots_left: int) -> None:
+    """Drop lots sold outside the strategy, taking them from the lock leg first."""
+    legs = position_legs(position)
+    excess = sum(int(leg["lots"]) for leg in legs.values()) - lots_left
+    for name in ("lock", "runner"):
+        if excess <= 0 or name not in legs:
+            continue
+        cut = min(excess, int(legs[name]["lots"]))
+        legs[name]["lots"] -= cut
+        excess -= cut
+        if legs[name]["lots"] <= 0:
+            del legs[name]
+    sync_position(position)
+
+
+def exit_legs(client, state: dict, names: list[str], spot: float) -> dict:
+    """Sell some legs of the position and re-park the backstop for the rest.
+
+    The resting stop covers every open lot, so it is cleared first (never
+    sell while it could still fire), then the legs are sold, then a fresh
+    backstop is parked for exactly the lots left. A refused sell keeps the
+    legs marked for a retry on the next bar.
+
+    Returns:
+        The updated state dict.
+    """
+    position = state["position"]
+    legs = position_legs(position)
+    lots = sum(int(legs[n]["lots"]) for n in names)
+    qty = int(position["lotsize"]) * lots
+    outcome = release_broker_stop(client, state) if BROKER_STOP else "clear"
+    if outcome == "filled":
+        return state
+    if outcome == "blocked":
+        for n in names:
+            legs[n]["exit_pending"] = True
+        return state
+    status, fill = market_order(client, position["symbol"], "SELL", qty)
+    if status != "complete":
+        if abandon_if_flat(client, state):
+            return state
+        for n in names:
+            legs[n]["exit_pending"] = True
+        log(f"{'+'.join(names)} exit {status}; retrying next bar")
+    else:
+        shown = f" at {fill:.2f}" if fill else ""
+        log(f"{'+'.join(names)} stop hit; sold {qty}{shown}, "
+            f"{position['lots_open'] - lots} lot(s) still open")
+        for n in names:
+            del legs[n]
+        sync_position(position)
+    if BROKER_STOP and not DRY_RUN and not position.get("stop_order_id"):
+        retry_broker_stop(client, position, spot)
+    return state
+
+
+def advance_leg_stop(name: str, stop: float, position: dict, entry: float,
+                     long: bool) -> float:
+    """Trail, lock, breakeven and step rules for one leg; only ever tightens."""
+    tag = f"[{name}] "
+
+    def tighten(level: float, what: str) -> None:
+        nonlocal stop
+        moved = max(stop, level) if long else min(stop, level)
+        if moved != stop:
+            log(f"{tag}{what}: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
+            stop = moved
+
+    level = trail_level(entry, position["mfe"], long)
+    if level is not None:
+        tighten(level, "trail")
+    risk = float(position.get("risk") or 0.0)
+    if LOCK_AT_R is not None and risk > 0 and position["mfe"] >= LOCK_AT_R * risk:
+        tighten(entry + LOCK_TO_R * risk if long else entry - LOCK_TO_R * risk,
+                f"lock +{LOCK_TO_R}R")
+    if BREAKEVEN_AT_PTS is not None and position["mfe"] >= BREAKEVEN_AT_PTS:
+        lock = RUNNER_LOCK_PTS if name == "runner" else BREAKEVEN_LOCK_PTS
+        tighten(entry + lock if long else entry - lock,
+                f"breakeven at +{BREAKEVEN_AT_PTS:.0f} (entry {lock:+.0f})")
+    stop0 = position.get("stop0")
+    if STEP_TRAIL_PTS is not None and stop0 is not None and position["mfe"] >= STEP_TRAIL_PTS:
+        steps = int(position["mfe"] // STEP_TRAIL_PTS)
+        tighten(float(stop0) + (1 if long else -1) * steps * STEP_TRAIL_MOVE_PTS, "step")
+    return stop
+
+
 def exit_position(client, state: dict, why: str) -> dict:
     """Clear the resting stop, then sell the whole open position.
 
@@ -1920,9 +2055,20 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
     excursion = (float(bar["high"]) - entry) if long else (entry - float(bar["low"]))
     position["mfe"] = max(float(position.get("mfe", 0.0)), excursion)
 
-    breached = (float(bar["low"]) <= stop) if long else (float(bar["high"]) >= stop)
-    if breached:
+    legs = position_legs(position)
+    hit = [name for name, leg in legs.items()
+           if leg.get("exit_pending")
+           or ((float(bar["low"]) <= float(leg["stop"])) if long
+               else (float(bar["high"]) >= float(leg["stop"])))]
+    if hit and len(hit) == len(legs):
         return exit_position(client, state, f"STOP hit at {stop:.2f} on the index")
+    if hit:
+        state = exit_legs(client, state, hit, float(bar["close"]))
+        position = state.get("position")
+        if not position:
+            return state
+        legs = position_legs(position)
+        stop = float(position["stop"])
 
     # The live watch between bars normally books the target; this catches a bar
     # that reached it while the watch was not looking (a slow cycle, a restart).
@@ -1941,50 +2087,12 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             return exit_position(client, state, f"CLOSE STOP: candle closed {close:.2f} "
                                  f"beyond candle 1's {side} {extreme:.2f}")
 
-    # Ratchet the stop behind the best price. It only ever moves in the trade's
-    # favour, and is checked against the NEXT bar, as the backtest does.
-    level = trail_level(entry, position["mfe"], long)
-    if level is not None:
-        moved = max(stop, level) if long else min(stop, level)
-        if moved != stop:
-            position["stop"] = moved
-            log(f"trail: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
-            stop = moved
-
-    # Profit lock, applied after the trail so it only ever tightens further.
-    risk = float(position.get("risk") or 0.0)
-    if LOCK_AT_R is not None and risk > 0 and position["mfe"] >= LOCK_AT_R * risk:
-        floor = entry + LOCK_TO_R * risk if long else entry - LOCK_TO_R * risk
-        moved = max(stop, floor) if long else min(stop, floor)
-        if moved != stop:
-            position["stop"] = moved
-            log(f"lock: best +{position['mfe']:.2f} pts is {LOCK_AT_R}R of "
-                f"{risk:.2f}, stop {stop:.2f} -> {moved:.2f} (+{LOCK_TO_R}R)")
-            stop = moved
-
-    # Breakeven, applied last so it too only ever tightens.
-    if BREAKEVEN_AT_PTS is not None and position["mfe"] >= BREAKEVEN_AT_PTS:
-        floor = entry + BREAKEVEN_LOCK_PTS if long else entry - BREAKEVEN_LOCK_PTS
-        moved = max(stop, floor) if long else min(stop, floor)
-        if moved != stop:
-            position["stop"] = moved
-            stop = moved
-            log(f"breakeven: best +{position['mfe']:.2f} pts clears "
-                f"{BREAKEVEN_AT_PTS:.0f}, stop -> {moved:.2f} "
-                f"(entry {BREAKEVEN_LOCK_PTS:+.0f})")
-
-    # Step stop, applied last so it only ever tightens: STEP_TRAIL_MOVE_PTS of
-    # stop for every STEP_TRAIL_PTS of best move, counted from the starting stop.
-    stop0 = position.get("stop0")
-    if STEP_TRAIL_PTS is not None and stop0 is not None and position["mfe"] >= STEP_TRAIL_PTS:
-        steps = int(position["mfe"] // STEP_TRAIL_PTS)
-        level = float(stop0) + (1 if long else -1) * steps * STEP_TRAIL_MOVE_PTS
-        current = float(position["stop"])
-        moved = max(current, level) if long else min(current, level)
-        if moved != current:
-            position["stop"] = moved
-            log(f"step: best +{position['mfe']:.2f} pts is {steps} x {STEP_TRAIL_PTS:.0f}, "
-                f"stop {current:.2f} -> {moved:.2f} ({STEP_TRAIL_MOVE_PTS:.0f} a step)")
+    # Ratchet each leg's stop behind the best price. A stop only ever moves in
+    # the trade's favour, and is checked against the NEXT bar, as the backtest
+    # does. The lock leg and the runner differ only at the breakeven step.
+    for name, leg in legs.items():
+        leg["stop"] = advance_leg_stop(name, float(leg["stop"]), position, entry, long)
+    sync_position(position)
 
     # A stop that failed to park at entry is retried every bar until it rests;
     # one that is resting is raised behind the in-process stop.
@@ -2129,7 +2237,7 @@ def cycle(client, state: dict) -> dict:
     state["trades"] = state.get("trades", 0) + 1
     state["position"] = {
         "direction": sig["direction"], "symbol": leg["symbol"],
-        "lotsize": leg["lotsize"], "lots_open": LOTS,
+        "lotsize": leg["lotsize"], "lots_open": LOTS, "legs": initial_legs(stop),
         "entry": spot, "stop": stop, "stop0": stop, "risk": risk,
         "mfe": 0.0, "opened": now.isoformat(),
         "c1_low": sig["c1_low"], "c1_high": sig["c1_high"], "target": None,
@@ -2250,7 +2358,8 @@ def main() -> int:
     log(f"filters: VIX >= {VIX_MIN}, SMA slope over {SLOPE_BARS} bars, "
         f"advance-decline >= {ADR_MIN}x; "
         f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts "
-        f"locks +{BREAKEVEN_LOCK_PTS} pts")
+        f"locks +{BREAKEVEN_LOCK_PTS} pts; {LOTS} lots, {RUNNER_LOTS} runner at "
+        f"entry {RUNNER_LOCK_PTS:+.0f}")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)

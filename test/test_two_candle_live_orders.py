@@ -87,6 +87,13 @@ class Broker:
     def quotes(self, **kw):
         return {"status": "success", "data": {"ltp": 100.0}}
 
+    def orderbook(self, **kw):
+        return {"status": "success", "data": {"orders": []}}
+
+    def optiongreeks(self, **kw):
+        return {"status": "success", "option_price": 200.0,
+                "greeks": {"delta": 0.6, "gamma": 0.0, "theta": 0.0, "vega": 0.0}}
+
     def market(self, action):
         return [o for o in self.orders if o["action"] == action and o["price_type"] == "MARKET"]
 
@@ -253,3 +260,118 @@ def test_nifty_breakeven_waits_for_the_threshold(path, monkeypatch):
     short_of = strat.BREAKEVEN_AT_PTS - 5
     state = strat.manage(Broker(held=65), state, nifty_bar(entry + short_of, entry + 1, entry + 2))
     assert state["position"]["stop"] == pytest.approx(25800.0)
+
+
+
+# ----------------------------------------------------------------------------
+# NIFTY two-lot split: one lot locks profit, the runner goes to breakeven
+# ----------------------------------------------------------------------------
+
+def two_lot_state(strat, stop_id=None):
+    state = nifty_state(stop_id=stop_id)
+    pos = state["position"]
+    pos["lots_open"] = 2
+    pos["legs"] = {"lock": {"lots": 1, "stop": pos["stop"]},
+                   "runner": {"lots": 1, "stop": pos["stop"]}}
+    return state
+
+
+def needs_split(strat):
+    if getattr(strat, "RUNNER_LOTS", 0) < 1 or strat.BREAKEVEN_AT_PTS is None:
+        pytest.skip("two-lot split is off in this copy")
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_entry_builds_a_lock_leg_and_a_runner(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_split(strat)
+    legs = strat.initial_legs(25800.0)
+    assert legs == {"lock": {"lots": strat.LOTS - strat.RUNNER_LOTS, "stop": 25800.0},
+                    "runner": {"lots": strat.RUNNER_LOTS, "stop": 25800.0}}
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_split_moves_the_lock_leg_to_profit_and_the_runner_to_entry(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_split(strat)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    state = two_lot_state(strat)
+    entry = state["position"]["entry"]
+    run = strat.BREAKEVEN_AT_PTS + 5
+    state = strat.manage(Broker(held=130), state, nifty_bar(entry + run, entry + 20, entry + run - 5))
+    legs = state["position"]["legs"]
+    assert legs["lock"]["stop"] == pytest.approx(entry + strat.BREAKEVEN_LOCK_PTS)
+    assert legs["runner"]["stop"] == pytest.approx(entry + strat.RUNNER_LOCK_PTS)
+    # the position stop - what the broker backstop mirrors - is the loosest leg
+    assert state["position"]["stop"] == pytest.approx(entry + strat.RUNNER_LOCK_PTS)
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_lock_leg_exits_alone_and_the_backstop_is_resized(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_split(strat)
+    state = two_lot_state(strat, stop_id="SL-0")
+    pos = state["position"]
+    entry = pos["entry"]
+    pos["mfe"] = 40.0
+    pos["legs"]["lock"]["stop"] = entry + 15
+    pos["legs"]["runner"]["stop"] = entry
+    pos["stop"] = entry
+    broker = Broker("complete", held=130)
+    # the bar dips to +10: through the lock leg's +15, not the runner's entry stop
+    state = strat.manage(broker, state, nifty_bar(entry + 30, entry + 10, entry + 12))
+    pos = state["position"]
+    assert pos is not None and list(pos["legs"]) == ["runner"]
+    assert pos["lots_open"] == 1
+    sells = broker.market("SELL")
+    assert len(sells) == 1 and sells[0]["quantity"] == 65
+    assert broker.cancelled[0] == "SL-0"                     # backstop cleared before the sell
+    stops = [o for o in broker.orders if o["price_type"] == "SL"]
+    assert stops and stops[-1]["quantity"] == 65             # re-parked for the runner only
+    assert pos["stop_order_id"] == stops[-1]["orderid"]
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_both_legs_hit_together_sell_once(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_split(strat)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    state = two_lot_state(strat)
+    entry = state["position"]["entry"]
+    broker = Broker("complete", held=130)
+    state = strat.manage(broker, state, nifty_bar(entry + 5, entry - 150, entry - 140))
+    assert state["position"] is None
+    sells = broker.market("SELL")
+    assert len(sells) == 1 and sells[0]["quantity"] == 130
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_refused_leg_exit_is_retried_next_bar(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_split(strat)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    state = two_lot_state(strat)
+    pos = state["position"]
+    entry = pos["entry"]
+    pos["mfe"] = 40.0
+    pos["legs"]["lock"]["stop"] = entry + 15
+    pos["legs"]["runner"]["stop"] = entry
+    pos["stop"] = entry
+    state = strat.manage(Broker("rejected", held=130), state,
+                         nifty_bar(entry + 30, entry + 10, entry + 12))
+    assert state["position"]["legs"]["lock"]["exit_pending"] is True
+    # next bar never comes back down to +15, but the pending exit still goes
+    broker = Broker("complete", held=130)
+    state = strat.manage(broker, state, nifty_bar(entry + 35, entry + 25, entry + 30))
+    assert list(state["position"]["legs"]) == ["runner"]
+    assert broker.market("SELL")[0]["quantity"] == 65
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_hand_sold_lot_comes_off_the_lock_leg_first(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_split(strat)
+    state = two_lot_state(strat)
+    strat.shrink_legs(state["position"], 1)
+    assert list(state["position"]["legs"]) == ["runner"]
+    assert state["position"]["lots_open"] == 1
