@@ -216,3 +216,40 @@ def test_bnf_leaves_a_held_or_unreadable_position_alone(path, monkeypatch):
         assert strat.closed_outside(broker, strat.LIVE_BOOK, book) is False
         assert book["position"] is not None
         assert broker.cancelled == []
+
+
+# ----------------------------------------------------------------------------
+# NIFTY breakeven-plus lock (2026-11-02 refinement)
+# ----------------------------------------------------------------------------
+
+def nifty_bar(high: float, low: float, close: float):
+    import pandas as pd
+    stamp = pd.Timestamp("2026-11-02 10:30", tz="Asia/Kolkata")
+    return pd.DataFrame({"open": [close], "high": [high], "low": [low], "close": [close]},
+                        index=[stamp])
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_nifty_breakeven_locks_profit_once_the_trade_runs(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    if strat.BREAKEVEN_AT_PTS is None:
+        pytest.skip("breakeven is off in this copy")
+    state = nifty_state(stop_id=None)
+    entry = state["position"]["entry"]
+    run = strat.BREAKEVEN_AT_PTS + 5
+    state = strat.manage(Broker(held=65), state, nifty_bar(entry + run, entry + 5, entry + run - 10))
+    assert state["position"]["stop"] == pytest.approx(entry + strat.BREAKEVEN_LOCK_PTS)
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_nifty_breakeven_waits_for_the_threshold(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    if strat.BREAKEVEN_AT_PTS is None:
+        pytest.skip("breakeven is off in this copy")
+    state = nifty_state(stop_id=None)
+    entry = state["position"]["entry"]
+    short_of = strat.BREAKEVEN_AT_PTS - 5
+    state = strat.manage(Broker(held=65), state, nifty_bar(entry + short_of, entry + 1, entry + 2))
+    assert state["position"]["stop"] == pytest.approx(25800.0)

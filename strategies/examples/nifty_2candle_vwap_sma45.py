@@ -27,8 +27,10 @@ Entry (long; short is the mirror):
        night over 2 bars, then off again (SLOPE_BARS = None) in favour of
        the breadth gate alone. See the tables at SLOPE_BARS.
     6. NIFTY 50 breadth leans with the trade: advancers at least ADR_MIN
-       (1.5) times decliners for a long, the reverse for a short, read from
-       multiquotes when the signal fires. Added 2026-09-22; see ADR_MIN.
+       times decliners for a long, the reverse for a short, read from
+       multiquotes when the signal fires. Added 2026-09-22 at 1.5x; OFF from
+       2026-11-02 (ADR_MIN = None) so the strategy trades 3+ days a week.
+       See ADR_MIN.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -73,7 +75,10 @@ Management (1 lot):
     lock       OFF since 2026-10-01 (LOCK_AT_R = None). When on, once the
                trade has run LOCK_AT_R times its initial risk, the stop is
                never worse than LOCK_TO_R times that risk in profit.
-    breakeven  OFF since 2026-10-01 (BREAKEVEN_AT_PTS = None).
+    breakeven  ON from 2026-11-02: once the trade has run BREAKEVEN_AT_PTS
+               (25) index points, the stop is never worse than
+               BREAKEVEN_LOCK_PTS (15) points in profit. Checked at the bar
+               close like every stop here, so the exit can land below +15.
     broker     the resting broker stop is a mechanical-failure backstop only.
     15:00      everything is squared off
 
@@ -318,7 +323,27 @@ LOCK_TO_R = 0.5                     # then the stop is at least this many R in p
 # with a slightly shallower drawdown. The entry index level is not a
 # zero-rupee exit: the 3-pt cost and a bar-close fill make it a small loss.
 # None disables it. Reproduce: session 31c213d0 scratchpad be_sweep.py.
-BREAKEVEN_AT_PTS = None             # was 40.0 (2026-09-24..30); off with the lock, see LOCK_AT_R
+# 2026-10-30, user's request: trade at least 3 days a week with the highest
+# win rate. Only removing the breadth gate gets the strategy onto 60%+ of
+# sessions; a breakeven-plus lock is the one exit that lifts the win rate on
+# every base without a fitted spike (win rate rises and PF falls smoothly as
+# the lock comes earlier). Replayed 2016-10..2026-10-30 on this script's own
+# rules, stop exits at the bar close, 3 pts a trade, points per lot:
+#
+#                          days    win% 24/25/26    PF 24/25/26     net 10y  PF 10y
+#   ADR 1.5, no BE (old)    37%    43 / 49 / 53   2.17/1.53/2.31   +5,352   1.32
+#   no ADR, BE 25 -> +15    63%    52 / 54 / 63   1.36/1.22/1.38     +269   1.01
+#   no ADR, BE 30 -> +10    63%    49 / 49 / 56   1.52/1.30/1.31   +1,627   1.06
+#   ADR 1.5, BE 30 -> +10   37%    57 / 57 / 60   2.04/1.63/1.88   +3,710   1.26
+#
+# The frequent version is close to breakeven over ten years (it loses 2017-19,
+# 2022 and 2023) and makes less than the old rules in 2024-26; the user chose
+# frequency and win rate knowingly. 3 trades a DAY was also tested: the
+# loosest rules average 2.1 a day at PF ~1.0. Revert: ADR_MIN = 1.5,
+# BREAKEVEN_AT_PTS = None. Reproduce: session bb9420a2 scratchpad
+# nf_research.py / nf_sweep.py (stage1-3).
+BREAKEVEN_AT_PTS = 25.0             # was None (2026-10-01..30), 40.0 with no lock (2026-09-24..30)
+BREAKEVEN_LOCK_PTS = 15.0           # the stop then sits this many points in profit
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
@@ -468,7 +493,7 @@ SLOPE_BARS = None
 # removed two winners (08-24, 09-11) and one small loser (08-21). The backtest
 # uses today's constituents throughout, so older years flatter it. Reproduce:
 # session febea895 scratchpad nifty_slope_adr.py, nifty_month_trades.py.
-ADR_MIN = 1.5
+ADR_MIN = None                      # was 1.5 (2026-09-22..10-30); off for 3+ trading days a week
 ADR_MIN_STOCKS = 40                 # skip the signal if fewer quotes are readable
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
@@ -1939,11 +1964,14 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
 
     # Breakeven, applied last so it too only ever tightens.
     if BREAKEVEN_AT_PTS is not None and position["mfe"] >= BREAKEVEN_AT_PTS:
-        moved = max(stop, entry) if long else min(stop, entry)
+        floor = entry + BREAKEVEN_LOCK_PTS if long else entry - BREAKEVEN_LOCK_PTS
+        moved = max(stop, floor) if long else min(stop, floor)
         if moved != stop:
             position["stop"] = moved
+            stop = moved
             log(f"breakeven: best +{position['mfe']:.2f} pts clears "
-                f"{BREAKEVEN_AT_PTS:.0f}, stop {stop:.2f} -> {moved:.2f} (entry)")
+                f"{BREAKEVEN_AT_PTS:.0f}, stop -> {moved:.2f} "
+                f"(entry {BREAKEVEN_LOCK_PTS:+.0f})")
 
     # Step stop, applied last so it only ever tightens: STEP_TRAIL_MOVE_PTS of
     # stop for every STEP_TRAIL_PTS of best move, counted from the starting stop.
@@ -2221,7 +2249,8 @@ def main() -> int:
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
     log(f"filters: VIX >= {VIX_MIN}, SMA slope over {SLOPE_BARS} bars, "
         f"advance-decline >= {ADR_MIN}x; "
-        f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts")
+        f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts "
+        f"locks +{BREAKEVEN_LOCK_PTS} pts")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)
