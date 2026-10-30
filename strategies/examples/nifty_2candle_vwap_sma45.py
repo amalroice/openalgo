@@ -348,6 +348,16 @@ BROKER_STOP_LIMIT_SLIP = 0.05       # limit sits this far below the trigger
 BROKER_STOP_MIN_RAISE = 0.5         # premium points
 TICK = 0.05                         # NFO option tick
 
+# Order settlement. A placeorder "success" only means the broker ACCEPTED the
+# order; the exchange can still reject it a moment later (2026-10-05: three
+# SENSEX exit sells were accepted, then rejected). Every market order is
+# therefore read back until it is complete, rejected or cancelled.
+ORDER_POLL_TRIES = 10               # 1 s reads a market order is given to settle
+ORDER_POLL_SECONDS = 1.0
+CANCEL_CONFIRM_TRIES = 6            # reads that a cancelled resting stop is gone
+CANCEL_CONFIRM_SECONDS = 0.5
+SQUARE_OFF_RETRY_SECONDS = 20       # exit retry cadence once past SQUARE_OFF
+
 # Regime filter: take no signal below this India VIX. Set to None to disable.
 # Lowered from 12 (at or below skipped) to 10 (10.00 and up trades) on
 # 2026-09-21 by the user's decision, then raised to 11 (11.00 and up trades) on
@@ -1203,24 +1213,85 @@ def nearest_weekly(client) -> str | None:
     return None
 
 
-def send(client, symbol: str, action: str, quantity: int) -> bool:
-    """Place one market order on the option leg.
+def order_status(client, order_id: str) -> tuple[str, float | None]:
+    """Read one order: (lower-case status, or "" when unreadable; average price)."""
+    try:
+        r = client.orderstatus(order_id=order_id, strategy=STRATEGY_TAG)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"orderstatus raised {exc!r} for {order_id}")
+        return "", None
+    if not ok(r):
+        return "", None
+    data = r.get("data") or {}
+    status = str(data.get("order_status") or data.get("status") or "").lower()
+    try:
+        price = float(data.get("average_price") or 0) or None
+    except (TypeError, ValueError):
+        price = None
+    return status, price
+
+
+def settle_order(client, order_id: str) -> tuple[str, float | None]:
+    """Wait for a market order to finish.
 
     Returns:
-        True when the order was accepted.
+        ("complete", average price or None), ("rejected", None),
+        ("cancelled", None) or ("unknown", None). An order still working
+        after ORDER_POLL_TRIES reads is cancelled first, so a late fill
+        cannot surprise a retry.
+    """
+    def terminal(status: str, price: float | None) -> tuple[str, float | None] | None:
+        if "complete" in status:
+            return "complete", price
+        if "reject" in status:
+            return "rejected", None
+        if "cancel" in status:
+            return "cancelled", None
+        return None
+
+    for attempt in range(ORDER_POLL_TRIES):
+        if attempt:
+            time.sleep(ORDER_POLL_SECONDS)
+        done = terminal(*order_status(client, order_id))
+        if done:
+            return done
+    try:
+        client.cancelorder(order_id=order_id, strategy=STRATEGY_TAG)
+    except Exception as exc:  # noqa: BLE001 - the read below decides
+        log(f"cancel of unsettled order {order_id} raised {exc!r}")
+    return terminal(*order_status(client, order_id)) or ("unknown", None)
+
+
+def market_order(client, symbol: str, action: str, quantity: int) -> tuple[str, float | None]:
+    """Place one market order on the option leg and read it to a final state.
+
+    Returns:
+        (status, average fill) as settle_order returns them. Only "complete"
+        means the lots changed hands; "unknown" means the caller must ask the
+        position book before believing either way.
     """
     if DRY_RUN:
         log(f"DRY_RUN {action} {quantity} {symbol}")
-        return True
-    r = client.placeorder(strategy=STRATEGY_TAG, symbol=symbol,
-                          action=action, exchange=FO_EXCHANGE,
-                          price_type="MARKET", product=PRODUCT,
-                          quantity=quantity)
+        return "complete", None
+    try:
+        r = client.placeorder(strategy=STRATEGY_TAG, symbol=symbol,
+                              action=action, exchange=FO_EXCHANGE,
+                              price_type="MARKET", product=PRODUCT,
+                              quantity=quantity)
+    except Exception as exc:  # noqa: BLE001 - the broker may still have taken it
+        log(f"order RAISED {action} {quantity} {symbol}: {exc!r}")
+        return "unknown", None
     if not ok(r):
         log(f"order REJECTED {action} {quantity} {symbol}: {r}")
-        return False
-    log(f"order OK {action} {quantity} {symbol} -> {r.get('orderid')}")
-    return True
+        return "rejected", None
+    order_id = str(r.get("orderid") or "")
+    if not order_id:
+        log(f"order {action} {quantity} {symbol} returned no order id: {r}")
+        return "unknown", None
+    status, price = settle_order(client, order_id)
+    fill = f" at {price:.2f}" if price else ""
+    log(f"order {status.upper()} {action} {quantity} {symbol} -> {order_id}{fill}")
+    return status, price
 
 
 def net_quantity(client, symbol: str) -> int | None:
@@ -1519,6 +1590,26 @@ def drop_resting_stop(client, position: dict, why: str) -> None:
         f"short. CANCEL IT BY HAND AT THE BROKER")
 
 
+def confirm_stop_gone(client, order_id: str) -> str:
+    """After an accepted cancel, read the stop until it shows gone or filled.
+
+    An accepted cancel is a request, not a result: selling before it lands
+    can leave two SELLs on one lot. Returns "gone", "filled", "open" (still
+    resting after every read) or "unknown" (never readable - the accepted
+    cancel is then trusted, as before this check existed).
+    """
+    seen = "unknown"
+    for attempt in range(CANCEL_CONFIRM_TRIES):
+        if attempt:
+            time.sleep(CANCEL_CONFIRM_SECONDS)
+        state = stop_order_state(client, order_id)
+        if state in ("gone", "filled"):
+            return state
+        if state == "open":
+            seen = "open"
+    return seen
+
+
 def release_broker_stop(client, state: dict) -> str:
     """Clear the resting stop before this process sends its own exit.
 
@@ -1545,6 +1636,16 @@ def release_broker_stop(client, state: dict) -> str:
         cancelled = False
 
     if cancelled:
+        confirmed = confirm_stop_gone(client, order_id)
+        if confirmed == "filled":
+            log(f"resting stop {order_id} filled before the cancel landed; the "
+                f"position is closed at the broker, clearing it locally")
+            state["position"] = None
+            return "filled"
+        if confirmed == "open":
+            log(f"cancel of stop {order_id} accepted but it still rests; holding "
+                f"off the exit rather than risking a double sell")
+            return "blocked"
         log(f"cancelled resting stop {order_id}")
         position.pop("stop_order_id", None)
         return "clear"
@@ -1756,8 +1857,10 @@ def exit_position(client, state: dict, why: str) -> dict:
         # accidental naked short.
         return state
     qty = int(position["lotsize"]) * int(position["lots_open"])
-    if send(client, position["symbol"], "SELL", qty):
-        log(f"{why}; closed {qty}")
+    status, fill = market_order(client, position["symbol"], "SELL", qty)
+    if status == "complete":
+        shown = f" at {fill:.2f}" if fill else ""
+        log(f"{why}; closed {qty}{shown}")
         state["position"] = None
     else:
         abandon_if_flat(client, state)
@@ -1887,8 +1990,10 @@ def square_off(client, state: dict) -> dict:
                 "gone. CHECK THE BROKER POSITION BY HAND")
             return state
     qty = int(position["lotsize"]) * int(position["lots_open"])
-    if send(client, position["symbol"], "SELL", qty):
-        log(f"square-off: closed {qty} {position['symbol']}")
+    status, fill = market_order(client, position["symbol"], "SELL", qty)
+    if status == "complete":
+        shown = f" at {fill:.2f}" if fill else ""
+        log(f"square-off: closed {qty} {position['symbol']}{shown}")
         state["position"] = None
     else:
         abandon_if_flat(client, state)
@@ -1983,8 +2088,15 @@ def cycle(client, state: dict) -> dict:
     log(f"{sig['direction'].upper()} signal: index {spot:.2f}, stop {stop:.2f} "
         f"(risk {risk:.2f} pts), buying {quantity} "
         f"{leg['symbol']}")
-    if not send(client, leg["symbol"], "BUY", quantity):
-        return state
+    status, fill = market_order(client, leg["symbol"], "BUY", quantity)
+    if status != "complete":
+        # "unknown" may still have filled: the position book is the tiebreaker.
+        held = net_quantity(client, leg["symbol"]) if status == "unknown" else 0
+        if not held or held < quantity:
+            log(f"entry {status}; staying flat")
+            return state
+        log(f"entry {status} but the broker holds {held} {leg['symbol']}; "
+            f"managing it as filled")
 
     state["trades"] = state.get("trades", 0) + 1
     state["position"] = {
@@ -1993,6 +2105,7 @@ def cycle(client, state: dict) -> dict:
         "entry": spot, "stop": stop, "stop0": stop, "risk": risk,
         "mfe": 0.0, "opened": now.isoformat(),
         "c1_low": sig["c1_low"], "c1_high": sig["c1_high"], "target": None,
+        "premium_in": fill,
     }
     if TARGET_R is not None:
         long = sig["direction"] == "long"
@@ -2155,6 +2268,10 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001 - one bad bar must not kill the day
                 log(f"cycle failed: {exc!r}")
             save_state(state)
+            if datetime.now(IST).time() >= SQUARE_OFF and state.get("position"):
+                # A refused square-off is retried every few seconds, not every bar.
+                time.sleep(SQUARE_OFF_RETRY_SECONDS)
+                continue
             sleep_to_next_bar(client, state)
     finally:
         save_state(state)

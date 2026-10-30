@@ -159,6 +159,10 @@ LIVE_LOTS = 1                       # lots per entry; quantity = lots x lotsize
 LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
 ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
 ORDER_POLL_SECONDS = 1
+CANCEL_CONFIRM_TRIES = 6            # reads that a cancelled backstop is really gone
+CANCEL_CONFIRM_SECONDS = 0.5
+MANUAL_EXIT_RECHECK_SECONDS = 2.0   # pause before trusting a flat position book
+SQUARE_OFF_RETRY_SECONDS = 20       # exit retry cadence once past SQUARE_OFF
 MAX_INITIAL_RISK_ATR = 2.5          # cap initial index risk, never widen past the box edge
 SLM_IV_BUFFER_POINTS = 2.0          # Greek-mapped backstop headroom for IV movement
 SLM_TICK = 0.05                     # BFO option price tick
@@ -797,6 +801,97 @@ def live_entry(client, leg: dict, spot: float, stop: float) -> dict | None:
             "slm_trigger": trigger, "premium_in": fill, "qty": qty}
 
 
+def net_quantity(client, symbol: str) -> int | None:
+    """Net open quantity the broker reports for one option leg.
+
+    Returns:
+        The quantity, 0 when nothing is open, or None when the book cannot be
+        read.
+    """
+    try:
+        r = client.positionbook()
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"positionbook raised {exc!r}")
+        return None
+    if not ok(r):
+        log(f"positionbook failed: {r}")
+        return None
+    for row in r.get("data") or []:
+        if row.get("symbol") == symbol and row.get("exchange") == FO_EXCHANGE:
+            try:
+                return int(float(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                log(f"unreadable quantity on {symbol}: {row.get('quantity')!r}")
+                return None
+    return 0
+
+
+def read_order(client, orderid: str) -> tuple[str, float | None]:
+    """One order's (lower-case status, or "" when unreadable; average price)."""
+    try:
+        r = client.orderstatus(order_id=orderid, strategy=STRATEGY_TAG)
+    except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
+        log(f"orderstatus raised {exc!r} for {orderid}")
+        return "", None
+    if not ok(r):
+        return "", None
+    data = r.get("data") or {}
+    status = str(data.get("order_status", "")).lower()
+    try:
+        price = float(data.get("average_price") or 0) or None
+    except (TypeError, ValueError):
+        price = None
+    return status, price
+
+
+def release_backstop(client, slm: str) -> tuple[str, float | None]:
+    """Cancel the SL-M backstop and confirm it is really gone before any sell.
+
+    An accepted cancel is a request, not a result, so the order is read back.
+    Returns ("gone", None), ("filled", fill) when the backstop fired first,
+    or ("live", None) when it may still fire - the caller must not sell.
+    A backstop that never becomes readable after an accepted cancel is
+    trusted gone, as before this check existed.
+    """
+    try:
+        cancelled = ok(client.cancelorder(order_id=slm, strategy=STRATEGY_TAG))
+    except Exception as exc:  # noqa: BLE001 - the reads below decide
+        log(f"cancel of SL-M {slm} raised {exc!r}")
+        cancelled = False
+    seen = ""
+    for attempt in range(CANCEL_CONFIRM_TRIES):
+        if attempt:
+            time.sleep(CANCEL_CONFIRM_SECONDS)
+        status, fill = read_order(client, slm)
+        if "complete" in status:
+            return "filled", fill
+        if "cancel" in status or "reject" in status:
+            return "gone", None
+        if status:
+            seen = status
+            if not cancelled:
+                break               # refused cancel on a live order: no point waiting
+    if cancelled and not seen:
+        return "gone", None
+    log(f"SL-M {slm} would not cancel ({seen or 'unknown'}); "
+        "refusing to sell twice, the next poll retries")
+    return "live", None
+
+
+def drop_backstop(client, pos: dict, why: str) -> None:
+    """Cancel a backstop whose position is already gone; shout if it will not go."""
+    slm = pos.get("slm_orderid")
+    if not slm:
+        return
+    how, _fill = release_backstop(client, slm)
+    pos["slm_orderid"] = None
+    if how == "live":
+        log(f"COULD NOT CANCEL SL-M {slm} ({why}). It may be live with no position "
+            f"behind it - CANCEL IT BY HAND AT THE BROKER")
+    else:
+        log(f"SL-M {slm} is {how}: {why}")
+
+
 def live_close(client, pos: dict) -> tuple[str, float | None]:
     """Cancel the SL-M backstop, then market-sell the full quantity.
 
@@ -807,41 +902,46 @@ def live_close(client, pos: dict) -> tuple[str, float | None]:
     """
     slm = pos.get("slm_orderid")
     if slm:
-        if not ok(client.cancelorder(order_id=slm, strategy=STRATEGY_TAG)):
-            st = client.orderstatus(order_id=slm, strategy=STRATEGY_TAG)
-            data = (st.get("data") or {}) if ok(st) else {}
-            status = str(data.get("order_status", "")).lower()
-            if status == "complete":
-                fill = float(data.get("average_price") or 0) or None
-                return "already-flat", fill or option_ltp(client, pos["symbol"])
-            log(f"SL-M {slm} would not cancel ({status or 'unknown'}); "
-                "refusing to sell twice, the next poll retries")
+        how, fill = release_backstop(client, slm)
+        if how == "filled":
+            pos["slm_orderid"] = None
+            return "already-flat", fill or option_ltp(client, pos["symbol"])
+        if how == "live":
             return "failed", None
         pos["slm_orderid"] = None
     qty = int(pos.get("qty") or 0)
+    status, fill = "unsent", None
     try:
         r = client.placeorder(strategy=STRATEGY_TAG, symbol=pos["symbol"], action="SELL",
                               exchange=FO_EXCHANGE, price_type="MARKET",
                               product=LIVE_PRODUCT, quantity=qty)
     except Exception as exc:  # noqa: BLE001 - treated as unsettled below
         log(f"LIVE sell raised {exc!r} for {pos['symbol']} x{qty}")
-        return "failed", None
-    if not ok(r):
+        r = None
+    if r is not None and not ok(r):
         log(f"LIVE sell rejected: {pos['symbol']} x{qty}: {r}")
-        return "failed", None
-    orderid = str(r.get("orderid") or "")
-    try:
-        status, fill = wait_order(client, orderid)
-    except Exception as exc:  # noqa: BLE001 - never leave a sell running unwatched
-        log(f"LIVE sell {orderid} unsettled ({exc!r}); cancelling blind")
+    elif r is not None:
+        orderid = str(r.get("orderid") or "")
         try:
-            client.cancelorder(order_id=orderid, strategy=STRATEGY_TAG)
-        except Exception as cancel_exc:  # noqa: BLE001
-            log(f"cancel of {orderid} failed: {cancel_exc!r}")
-        return "failed", None
-    if status == "complete":
-        return "closed", fill or option_ltp(client, pos["symbol"])
-    log(f"LIVE sell {orderid} ended '{status}'; the position stays for a retry")
+            status, fill = wait_order(client, orderid)
+        except Exception as exc:  # noqa: BLE001 - never leave a sell running unwatched
+            log(f"LIVE sell {orderid} unsettled ({exc!r}); cancelling blind")
+            try:
+                client.cancelorder(order_id=orderid, strategy=STRATEGY_TAG)
+            except Exception as cancel_exc:  # noqa: BLE001
+                log(f"cancel of {orderid} failed: {cancel_exc!r}")
+        if status == "complete":
+            return "closed", fill or option_ltp(client, pos["symbol"])
+        log(f"LIVE sell {orderid} ended '{status}'")
+    # A refused sell means either the order failed (retry) or there is
+    # nothing left to sell - closed by hand or by the broker, which then
+    # rejects every SELL as a fresh short (2026-10-05, three times). The
+    # position book is the tiebreaker.
+    held = net_quantity(client, pos["symbol"])
+    if held is not None and held <= 0:
+        log(f"broker holds {held} {pos['symbol']}; it was closed outside the strategy")
+        return "outside", option_ltp(client, pos["symbol"])
+    log(f"the position stays for a retry (broker holds {held if held is not None else 'unknown'})")
     return "failed", None
 
 
@@ -850,7 +950,7 @@ def live_close(client, pos: dict) -> tuple[str, float | None]:
 # =============================================================================
 
 def close_position(client, name: str, book: dict, price: float, why: str,
-                   bar_start: str) -> bool:
+                   bar_start: str, settled: tuple[str, float | None] | None = None) -> bool:
     """Close the book's position and log index and option results.
 
     Live, the SL-M backstop is cancelled BEFORE the market sell - never the
@@ -863,12 +963,14 @@ def close_position(client, name: str, book: dict, price: float, why: str,
     note = ""
     premium = None
     if live:
-        how, premium = live_close(client, pos)
+        how, premium = settled if settled is not None else live_close(client, pos)
         if how == "failed":
             log(f"[{name}] LIVE exit ({why}) unsettled; keeping the position for a retry")
             return False
         if how == "already-flat":
             note = "; SL-M backstop fired first"
+        if how == "outside":
+            note = "; closed outside the strategy, the broker was already flat"
     else:
         premium = option_ltp(client, pos["symbol"]) if pos.get("symbol") else None
     long = pos["direction"] == "long"
@@ -904,6 +1006,47 @@ def next_bar_start(stamp: datetime) -> str:
     return start.isoformat()
 
 
+def reconcile_live(client, name: str, book: dict) -> bool:
+    """Book out a live position the broker no longer holds.
+
+    The backstop may have fired between polls, or the lot may have been sold
+    by hand at the broker. Either way the process must stop managing it, and
+    a backstop left behind a hand exit must be pulled before it can sell a
+    naked short. A flat book is read twice before it is believed.
+
+    Returns:
+        True when the position was booked out.
+    """
+    pos = book.get("position")
+    if not pos or not pos.get("buy_orderid"):
+        return False
+    stamp = next_bar_start(datetime.now(IST))
+    slm = pos.get("slm_orderid")
+    if slm:
+        status, fill = read_order(client, slm)
+        if "complete" in status:
+            pos["slm_orderid"] = None
+            log(f"[{name}] SL-M backstop {slm} filled at the broker")
+            return close_position(client, name, book, index_ltp(client) or pos["stop"],
+                                  "backstop", stamp,
+                                  settled=("already-flat", fill or option_ltp(client, pos["symbol"])))
+    held = net_quantity(client, pos["symbol"])
+    if held is None or held > 0:
+        return False
+    time.sleep(MANUAL_EXIT_RECHECK_SECONDS)
+    held = net_quantity(client, pos["symbol"])
+    if held is None or held > 0:
+        return False
+    if held < 0:
+        log(f"[{name}] broker reports {held} {pos['symbol']} - NET SHORT, not the long "
+            f"option this strategy bought. CHECK THE BROKER POSITION BY HAND")
+    log(f"[{name}] {pos['symbol']} was closed outside the strategy (manual exit?)")
+    drop_backstop(client, pos, "the position was closed outside the strategy")
+    return close_position(client, name, book, index_ltp(client) or pos["entry"],
+                          "closed-outside", stamp,
+                          settled=("outside", option_ltp(client, pos["symbol"])))
+
+
 def manage(client, name: str, book: dict, frame: pd.DataFrame) -> None:
     """Catch stops, retry an unprotected emergency exit, then ratchet the trail."""
     pos = book.get("position")
@@ -912,6 +1055,8 @@ def manage(client, name: str, book: dict, frame: pd.DataFrame) -> None:
     if pos.get("emergency_exit"):
         close_position(client, name, book, index_ltp(client) or pos["entry"],
                        "unprotected-entry", next_bar_start(datetime.now(IST)))
+        return
+    if reconcile_live(client, name, book):
         return
     long = pos["direction"] == "long"
     since = frame[frame.index >= pd.Timestamp(pos["entry_bar"])]
@@ -1180,6 +1325,10 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001 - one bad bar must not kill the day
                 log(f"cycle failed: {exc!r}")
             save_state(state)
+            if datetime.now(IST).time() >= SQUARE_OFF and open_books(state):
+                # A refused square-off is retried every few seconds, not every bar.
+                time.sleep(SQUARE_OFF_RETRY_SECONDS)
+                continue
             sleep_to_next_bar(client, state)
     finally:
         save_state(state)

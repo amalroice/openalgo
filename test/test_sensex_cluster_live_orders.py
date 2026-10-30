@@ -29,13 +29,16 @@ class StubClient:
 
     def __init__(self, buy_ok=True, buy_status=("complete", 412.5),
                  sell_status=("complete", 355.0), slm_ok=True,
-                 slm_status=("open", 0.0), cancel_ok=True):
+                 slm_status=("open", 0.0), cancel_ok=True, cancel_lands=True,
+                 held=None):
         self.buy_ok = buy_ok
         self.buy_status = buy_status
         self.sell_status = sell_status
         self.slm_ok = slm_ok
         self.slm_status = slm_status
         self.cancel_ok = cancel_ok
+        self.cancel_lands = cancel_lands    # an accepted cancel really removes the order
+        self.held = held                    # positionbook quantity; None = unreadable
         self.greeks_ok = True
         self.index_price = 75000.0
         self.events: list[str] = []
@@ -59,6 +62,8 @@ class StubClient:
         self.events.append(f"status:{order_id}")
         if order_id.startswith("SLM"):
             state, price = self.slm_status
+            if order_id in self.cancelled and self.cancel_lands:
+                state, price = "cancelled", 0.0
         elif order_id.startswith("BUY"):
             state, price = self.buy_status
         else:
@@ -78,6 +83,13 @@ class StubClient:
         return {"status": "success", "option_price": 400.0,
                 "greeks": {"delta": 0.8, "gamma": 0.0, "theta": 0.0, "vega": 0.0}}
 
+    def positionbook(self, **kw):
+        if self.held is None:
+            return {"status": "error", "message": "book unavailable"}
+        return {"status": "success",
+                "data": [{"symbol": LEG["symbol"], "exchange": "BFO",
+                          "quantity": str(self.held)}]}
+
     def cancelorder(self, *, order_id, strategy="Python", **kw):
         if self.cancel_ok or order_id.startswith(("BUY", "SELL")):
             self.cancelled.append(order_id)
@@ -90,6 +102,8 @@ def fast_order_poll(monkeypatch):
     """No real sleeping or long poll loops in unit tests."""
     monkeypatch.setattr(scb, "ORDER_POLL_TRIES", 1)
     monkeypatch.setattr(scb, "ORDER_POLL_SECONDS", 0)
+    monkeypatch.setattr(scb, "CANCEL_CONFIRM_SECONDS", 0)
+    monkeypatch.setattr(scb, "MANUAL_EXIT_RECHECK_SECONDS", 0)
 
 
 def placed(client, kind, price_type):
@@ -249,3 +263,80 @@ def test_close_position_settles_a_live_exit_and_accounts_the_fill():
     assert closed["premium_in"] == 412.5              # actual fill, not the quote
     assert closed["premium_out"] == 355.0             # actual fill
     assert closed["gross"] == pytest.approx(-100.0)   # index: 75000 -> 74900 short-fall
+
+
+def test_live_close_waits_for_an_accepted_cancel_to_land():
+    client = StubClient(cancel_lands=False, slm_status=("trigger pending", 0.0))
+    pos = {"symbol": LEG["symbol"], "qty": LEG["lotsize"], "buy_orderid": "BUY1",
+           "slm_orderid": "SLM2"}
+    assert scb.live_close(client, pos) == ("failed", None)
+    assert placed(client, "SELL", "MARKET") == []     # never two SELLs on one lot
+    assert pos["slm_orderid"] == "SLM2"               # still tracked for the retry
+
+
+def test_live_close_reads_a_flat_book_after_a_rejected_sell():
+    # 2026-10-05: the lot was already gone, so every SELL was a fresh short
+    client = StubClient(sell_status=("rejected", 0.0), held=0)
+    pos = {"symbol": LEG["symbol"], "qty": LEG["lotsize"], "buy_orderid": "BUY1",
+           "slm_orderid": "SLM2"}
+    how, _premium = scb.live_close(client, pos)
+    assert how == "outside"
+    assert pos["slm_orderid"] is None
+
+
+def test_live_close_keeps_a_held_position_after_a_rejected_sell():
+    client = StubClient(sell_status=("rejected", 0.0), held=LEG["lotsize"])
+    pos = {"symbol": LEG["symbol"], "qty": LEG["lotsize"], "buy_orderid": "BUY1",
+           "slm_orderid": "SLM2"}
+    assert scb.live_close(client, pos) == ("failed", None)
+
+
+def test_close_position_books_out_a_position_closed_outside():
+    client = StubClient(sell_status=("rejected", 0.0), held=0)
+    book = live_book()
+    assert scb.close_position(client, "boxatr", book, 74900.0, "square-off",
+                              "2026-10-05T15:05:00+05:30") is True
+    assert book["position"] is None
+    assert book["closed"][0]["why"] == "square-off"
+
+
+def test_manage_books_out_a_fired_backstop_without_selling():
+    client = StubClient(slm_status=("complete", 250.0), held=0)
+    book = live_book()
+    scb.manage(client, "boxatr", book, pd.DataFrame())
+    assert book["position"] is None
+    assert book["closed"][0]["why"] == "backstop"
+    assert book["closed"][0]["premium_out"] == 250.0
+    assert placed(client, "SELL", "MARKET") == []
+
+
+def test_manage_notices_a_hand_exit_and_pulls_the_backstop():
+    client = StubClient(held=0)
+    book = live_book()
+    scb.manage(client, "boxatr", book, pd.DataFrame())
+    assert book["position"] is None
+    assert book["closed"][0]["why"] == "closed-outside"
+    assert "SLM2" in client.cancelled
+    assert placed(client, "SELL", "MARKET") == []
+
+
+def no_bars():
+    """An empty bar frame with the time index manage() expects."""
+    return pd.DataFrame(columns=["high", "low"],
+                        index=pd.DatetimeIndex([], tz="Asia/Kolkata"))
+
+
+def test_manage_leaves_a_held_position_alone():
+    client = StubClient(held=LEG["lotsize"])
+    book = live_book()
+    scb.manage(client, "boxatr", book, no_bars())
+    assert book["position"] is not None
+    assert client.cancelled == []
+
+
+def test_manage_does_nothing_when_the_book_is_unreadable():
+    client = StubClient(held=None)
+    book = live_book()
+    scb.manage(client, "boxatr", book, no_bars())
+    assert book["position"] is not None
+    assert client.cancelled == []
