@@ -20,10 +20,12 @@ or the index gaps. It is cancelled before every exit so it can never
 double-sell, and an orphaned one is pulled when the broker reports the position
 already flat. Set BROKER_STOP = False to rely on the in-process poll alone.
 
-SHORT-ONLY, ATR stop and a 100-point target since 2026-10-04. The long side
-was removed and the exit rebuilt after a 478-session study (2024-10-01 ..
-2026-09-30): the raw rule won 24.5% of its trades, and the change below lifts
-that to 62.4% with a higher profit factor. See EVIDENCE at the end.
+SHORT-ONLY, 4 x ATR stop, NO target (held to the 15:00 square-off), plain
+book live - since 2026-11-02. The 3 x ATR stop with a 100-point target
+(2026-10-04 .. 10-30) was fitted on 2024-10 .. 2026-09 only; on 2021-23,
+which it never saw, it made PF 1.06 with 2023 negative, and October 2026 lost
+(breadth book -584 pts). Its winners were capped at ~+96 while stopped losers
+cost 200-240. See EVIDENCE at the end.
 
 Bars: 3-minute candles built from 1-minute history, anchored at 09:15, exactly
 as the backtest builds them. VWAP is the day's index typical price weighted by
@@ -38,23 +40,45 @@ Rule (short; the long mirror is computed but not traded - see DIRECTIONS):
     2. Entry: at the next bar's open - here, the index price when candle 2 has
        just completed - between NO_NEW_ENTRY_BEFORE (10:15) and
        NO_NEW_ENTRY_AFTER (14:30).
-    3. Stop: ATR_STOP_MULT (3) times ATR(14) of the 3m bars beyond the entry,
+    3. Stop: ATR_STOP_MULT (4) times ATR(14) of the 3m bars beyond the entry,
        so the stop breathes with volatility instead of pinning candle 1. The
        candle-1 stop is kept only as a fallback while the ATR has not warmed.
-    4. Target: TARGET_PTS (100) index points from the entry, banked the moment
-       the index trades there. No trail.
+    4. Target: none (TARGET_PTS = None) - the trade is held to SQUARE_OFF
+       unless the stop is hit. No trail.
     5. At most MAX_TRADES_PER_DAY (2), one position at a time per book.
 
 Two books run side by side on the same bars; LIVE_BOOK places the real order
 and the other is paper:
-    plain     the rule above, without the breadth filter (paper only)
+    plain     the rule above, without the breadth filter. LIVE_BOOK from
+              2026-11-02.
     breadth   the rule above, taken only when the 14 NIFTY Bank stocks are
               one-sided by BREADTH_MIN (2x): advancers at least twice decliners
               or the reverse, in EITHER direction ("a decisive day"), read
-              against each stock's previous close when the signal fires. This
-              breadth-filtered book is LIVE_BOOK; plain remains paper.
+              against each stock's previous close when the signal fires. Live
+              2026-10-04 .. 10-30; paper from 2026-11-02 (it cuts profit about
+              in half on the new exit).
 
-EVIDENCE - rebuilt 2026-10-04 from cached 1m bars (478 sessions, 2024-10-01 ..
+EVIDENCE - rebuilt 2026-10-31 on 1m bars 2021-01 .. 2026-10-30 (BANKNIFTY and
+the six volume banks from 2021, all 14 breadth banks from 2024-10), 4 pts cost a
+trade, stops filled AT their level, entry at the next bar's open. Chosen on
+2021-23, checked on 2024-26; index points, 1 lot:
+
+    shorts, plain book       2021-23 PF / net   2024-26 PF / net   Oct-26   years +
+    3 x ATR + 100 target     1.06 / +1,662      1.17 / +4,193       -286     5/6
+    4 x ATR, hold to 15:00   1.29 / +9,919      1.26 / +8,481       +160     6/6
+
+    4 x ATR hold by year: 2021 +6,904, 2022 +2,113, 2023 +903, 2024 +3,486,
+    2025 +2,705, 2026 +2,290 (to 10-30). Win rate ~46-49% (was ~57-62%);
+    average win +196, average loss -139; maxDD -2,668 pts; worst trade -415.
+    Every stop from 3 to 6 ATR held to 15:00 gives PF 1.21-1.29 and 6/6 years
+    positive (a plateau). A fixed target is the worst exit family: every
+    100-200 pt target ranks below holding. Breadth book on the same exit,
+    2024-10 .. 2026-09: +4,111 vs +6,849 plain. Longs on the same exit:
+    2024-26 PF 0.97, so shorts only stays. Reproduce: session e5b5848a
+    scratchpad bnf_h.py / bnf_sweep.py / bnf_plateau.py (wraps the harness
+    below on a merged 2021-2026 cache).
+
+Earlier EVIDENCE (2026-10-04, superseded) - cached 1m bars (478 sessions, 2024-10-01 ..
 2026-09-30), 4 pts cost a trade, 1 lot of 30, stops and targets filled AT their
 level, a bar that touches both scored as a stop:
 
@@ -78,7 +102,7 @@ level, a bar that touches both scored as a stop:
     not a fitted optimum. Reproduce: backtesting/banknifty-2candle/research/.
 
 THE REASON THIS IS LOGGED HEAVILY is cost: the edge is real but modest - about
-12 index points a trade net of the 4-point cost, roughly what monthly-option
+20 index points a trade net of the 4-point cost (12 on the old exit), near what monthly-option
 spreads and slippage may take. Every exit logs the option premium in and out,
 and every stop exit the index price actually seen. Reproduce:
 backtesting/banknifty-2candle/research/ (harness.py + exp_atr.py).
@@ -117,14 +141,14 @@ FO_EXCHANGE = "NFO"
 BAR_MINUTES = 3
 SMA_PERIOD = 45
 ATR_PERIOD = 14                     # Wilder ATR on the 3m bars, sizes the stop
-ATR_STOP_MULT = 3.0                 # stop sits this many ATRs beyond the entry
-TARGET_PTS = 100.0                  # index-point target, banked on touch
+ATR_STOP_MULT = 4.0                 # stop sits this many ATRs beyond the entry; 3.0 until 2026-10-31
+TARGET_PTS = None                   # no target, held to SQUARE_OFF; 100.0 until 2026-10-31
 DIRECTIONS = ("short",)             # long side removed, see EVIDENCE in the docstring
 
 # LIVE TRADING
 I_UNDERSTAND_THIS_IS_LIVE = True    # False refuses real orders outside analyzer mode
 DRY_RUN = False                     # True resolves and logs the orders, places nothing
-LIVE_BOOK = "breadth"               # live entries must pass the 14-bank breadth filter; plain stays paper
+LIVE_BOOK = "plain"                 # plain book trades live; breadth is paper ("breadth" until 2026-10-31)
 PRODUCT = "MIS"                     # intraday, squared off the same session
 LOTS = 1                            # lots sent per live entry
 BROKER_STOP = True                  # park a resting SL at the broker as a backstop
@@ -1232,7 +1256,9 @@ def cycle(client, state: dict) -> dict:
             stop = atr_stop_level(spot, atr, long)
         else:
             stop = sig["stop"]      # candle-1 fallback until the ATR has warmed up
-        target = spot + TARGET_PTS if long else spot - TARGET_PTS
+        target = None
+        if TARGET_PTS is not None:
+            target = spot + TARGET_PTS if long else spot - TARGET_PTS
         risk = abs(spot - stop)
         if risk <= 0:
             parts.append(f"{name}: {side} pair ignored, index {spot:.2f} sits on the stop")
@@ -1269,7 +1295,8 @@ def cycle(client, state: dict) -> dict:
         log(f"[{name}] {'LIVE' if live else 'PAPER'} {side.upper()}: candles "
             f"{sig['c1'].name:%H:%M} and {sig['c2'].name:%H:%M} clear of VWAP and SMA{SMA_PERIOD}; "
             f"entry {spot:.2f}, stop {stop:.2f} ({ATR_STOP_MULT:g} x ATR {atr_text}, "
-            f"risk {risk:.2f} pts), target {target:.2f}, held to {SQUARE_OFF:%H:%M}; "
+            f"risk {risk:.2f} pts), {f'target {target:.2f}' if target is not None else 'no target'}, "
+            f"held to {SQUARE_OFF:%H:%M}; "
             f"{leg['symbol'] if leg else 'option unresolved'} x{qty} premium {shown}")
         book["trades"] += 1
         book["position"] = {
@@ -1322,9 +1349,10 @@ def main() -> int:
             else f"LIVE, the {LIVE_BOOK} book places real orders")
     log(f"{STRATEGY_TAG} starting, {mode}: {BAR_MINUTES}m two-candle VWAP+SMA{SMA_PERIOD}, "
         f"directions {','.join(DIRECTIONS)}, stop {ATR_STOP_MULT:g} x ATR{ATR_PERIOD}, "
-        f"target {TARGET_PTS:g} pts, entries {NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, "
-        f"max {MAX_TRADES_PER_DAY} a day, square-off {SQUARE_OFF:%H:%M}; books: plain (paper), breadth (live, "
-        f">={BREADTH_MIN:g}x filter) "
+        f"{f'target {TARGET_PTS:g} pts' if TARGET_PTS is not None else 'no target'}, "
+        f"entries {NO_NEW_ENTRY_BEFORE:%H:%M}-{NO_NEW_ENTRY_AFTER:%H:%M}, "
+        f"max {MAX_TRADES_PER_DAY} a day, square-off {SQUARE_OFF:%H:%M}; books: plain, breadth "
+        f"(live book: {LIVE_BOOK}; breadth >={BREADTH_MIN:g}x filter) "
         f"({len(BREADTH_CONSTITUENTS)} banks >= {BREADTH_MIN:g}x either way); option {ITM_POINTS} pts ITM; "
         f"broker stop {'ON' if BROKER_STOP else 'OFF'}")
 

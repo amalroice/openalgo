@@ -13,6 +13,7 @@ import sys
 import types
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,6 +172,28 @@ def bnf_book():
         "risk": 230.0, "opened": "2026-11-02T10:54:00+05:30",
         "entry_bar": "2026-11-02T10:54:00+05:30", "symbol": SYMBOL, "qty": 30,
         "lotsize": 30, "live": True, "premium_in": 820.0, "stop_order_id": "SL-0"}}
+
+
+@pytest.mark.parametrize("path", BNF_PATHS)
+def test_bnf_without_a_target_holds_a_winner_and_still_stops_a_loser(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    assert strat.TARGET_PTS is None
+    broker = Broker(held=0)
+    book = bnf_book()
+    pos = book["position"]
+    pos.update(target=None, live=False)
+    pos.pop("stop_order_id")
+    idx = pd.DatetimeIndex([pd.Timestamp("2026-11-02T10:57:00+05:30")])
+    # a 300-point drop in the short's favour: nothing closes it before square-off
+    win_bar = pd.DataFrame({"open": [54650.0], "high": [54660.0], "low": [54400.0], "close": [54420.0]}, index=idx)
+    strat.manage(broker, "breadth", book, win_bar)
+    assert book["position"] is not None
+    # a bar through the stop still exits
+    loss_bar = pd.DataFrame({"open": [54800.0], "high": [54940.0], "low": [54790.0], "close": [54935.0]}, index=idx)
+    monkeypatch.setattr(strat, "index_ltp", lambda client: 54935.0)
+    strat.manage(broker, "breadth", book, loss_bar)
+    assert book["position"] is None
+    assert book["closed"][0]["why"] == "stop"
 
 
 @pytest.mark.parametrize("path", BNF_PATHS)

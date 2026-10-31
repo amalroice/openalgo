@@ -1,4 +1,4 @@
-"""Regression tests for BANKNIFTY live stop direction and breadth selection."""
+"""Regression tests for BANKNIFTY live stop direction, exit and live-book selection."""
 from __future__ import annotations
 
 import importlib.util
@@ -34,17 +34,20 @@ def test_atr_stop_is_on_losing_side_for_both_directions(path, monkeypatch):
     short_stop = strategy.atr_stop_level(entry, atr, long=False)
     long_stop = strategy.atr_stop_level(entry, atr, long=True)
 
-    assert short_stop == pytest.approx(54923.09)
+    assert short_stop == pytest.approx(54686.75 + 4.0 * 78.78)
     assert short_stop > entry
-    assert long_stop == pytest.approx(54450.41)
+    assert long_stop == pytest.approx(54686.75 - 4.0 * 78.78)
     assert long_stop < entry
 
 
 @pytest.mark.parametrize("path", STRATEGY_PATHS)
-def test_breadth_book_is_the_only_live_book(path, monkeypatch):
+def test_plain_book_is_the_only_live_book(path, monkeypatch):
     strategy = load_strategy(path, monkeypatch)
 
-    assert strategy.LIVE_BOOK == "breadth"
+    assert strategy.LIVE_BOOK == "plain"
+    assert "plain" in strategy.BOOKS
+    assert strategy.ATR_STOP_MULT == 4.0
+    assert strategy.TARGET_PTS is None
     assert "breadth" in strategy.BOOKS
     assert strategy.BREADTH_MIN == 2.0
     assert strategy.breadth_passes(12, 2)
