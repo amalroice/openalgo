@@ -15,6 +15,12 @@ ever sent. Orders follow the platform's Analyze (sandbox) versus Live mode,
 so the same script can be dry run on the sandbox before real money is at risk.
 Exit failures are retried, never assumed flat.
 
+From 2026-11-02 each signal trades a lock lot and a runner lot ("two locks",
+see LOCK_AT_ATR): the lock lot is floored at entry + 1 ATR once the move
+reaches 2 ATR, the runner at entry + 1 ATR once it reaches 4 ATR, ATR being
+the ATR(14) at entry; each lot exits on its own stop. On a gap day (open at
+least GAP_SIZE_PCT from the previous close) both lots are doubled.
+
 There is no target: winners ride to the square-off on the trail, losers are
 cut at the tighter box-edge or 2.5xATR initial index stop. Every exit logs
 index slippage against the stop and, for live positions, the option fill
@@ -47,7 +53,8 @@ Rule (long; short is the mirror):
        cluster may only start on the bar after the exit bar.
 
 Active-day filter (added 2026-09-27), read when a signal fires:
-    India VIX above VIX_MIN (13), AND NIFTY 50 breadth one-sided by BREADTH_MIN
+    India VIX above VIX_MIN (13), AND NIFTY 50
+    breadth one-sided by BREADTH_MIN
     (2x): advancers at least twice decliners, or decliners at least twice
     advancers, in EITHER direction - a short breakout on a strongly up day
     qualifies too. It is a "decisive day" test, not a trend-direction test.
@@ -149,13 +156,48 @@ TRAIL_DIST_PCT = 0.005              # stop distance behind the best price
 TRAIL_STEP_PCT = 0.002              # the stop moves once per step of this size
 MAX_TRADES_PER_DAY = 2
 BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points at every level tested
+# "Two locks" plus gap sizing, user's request 2026-10-31. Every lot rides the
+# trail; on top, each lot's stop gets a floor scaled by the ATR(14) read at
+# entry (the volatility the trade was taken in, not fixed points as on NIFTY):
+#   lock lot:   once the best move reaches LOCK_AT_ATR (2) x ATR, its stop is
+#               never worse than entry + LOCK_ATR (1) x ATR
+#   runner lot: once the best move reaches RUNNER_LOCK_AT_ATR (4) x ATR, its
+#               stop is never worse than entry + RUNNER_LOCK_ATR (1) x ATR
+# Each lot exits on its own stop; the SL-M backstop always covers exactly the
+# lots still open. Entries stop at 13:30 (NO_NEW_ENTRY_AFTER): late
+# breakouts were mostly losers. On a gap day, today's open at least
+# GAP_SIZE_PCT (0.4%) from the previous session's close either way, every
+# lot count is multiplied by GAP_LOT_MULTIPLIER (2): 4 lots instead of 2.
+#
+# Replayed 2016-10..2026-10-30 on these rules (stops filled at the level,
+# 10 pts a lot, index points; win = the whole trade > 0):
+#
+#                              trades  win%   PF    net pts  pts/lot  maxDD   worst day
+#   old: 2 lots, no lock        1,711  41.8  1.34   +81,554    23.8   -4,766     -948
+#   two locks, 2 lots           1,548  46.6  1.35   +69,136    22.3   -4,175     -948
+#   two locks + gap sizing      1,548  46.6  1.39  +108,304    24.7   -5,973   -1,881
+#
+# Win rate about 5 points higher in every year 2017-2026; 2017 and 2018 lose
+# (the old rules lost only 2018). October 2026: +2,311 pts vs +1,524 old.
+# Gap sizing is a modest edge (+5-12% per lot in every test window) and
+# doubles the worst day. Locks at 1.5-2.5 ATR all behave alike (a plateau).
+# Revert: LOCK_AT_ATR = RUNNER_LOCK_AT_ATR = None, GAP_LOT_MULTIPLIER = 1,
+# NO_NEW_ENTRY_AFTER 14:30. Reproduce: session e5b5848a scratchpad sxw.py /
+# sxw2.py / sizing.py / tenyr.py.
+LOCK_AT_ATR = 2.0                   # best move, in entry ATRs, that arms the lock lot's floor
+LOCK_ATR = 1.0                      # the lock lot's floor, entry ATRs in profit
+RUNNER_LOTS = 1                     # of LIVE_LOTS, these use the runner's lock
+RUNNER_LOCK_AT_ATR = 4.0            # best move, in entry ATRs, that arms the runner's floor
+RUNNER_LOCK_ATR = 1.0               # the runner's floor, entry ATRs in profit
+GAP_SIZE_PCT = 0.004                # |open / previous close - 1| at or above this is a gap day
+GAP_LOT_MULTIPLIER = 2              # lots multiplied by this on a gap day; 1 switches sizing off
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
 # Live orders. TRADE_LIVE False makes every path paper-only again. Orders
 # follow the platform's Analyze (sandbox) versus Live mode, so this same code
 # can be dry run on the sandbox before real money is at risk.
 TRADE_LIVE = True
-LIVE_LOTS = 1                       # lots per entry; quantity = lots x lotsize
+LIVE_LOTS = 2                       # lock + runner; 1 until 2026-10-30; x GAP_LOT_MULTIPLIER on a gap day
 LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
 ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
 ORDER_POLL_SECONDS = 1
@@ -184,7 +226,7 @@ ITM_POINTS = 100                    # strike this far in the money; was ATM unti
 
 SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(9, 30)
-NO_NEW_ENTRY_AFTER = dtime(14, 30)
+NO_NEW_ENTRY_AFTER = dtime(13, 30)  # 14:30 until 2026-10-31
 SQUARE_OFF = dtime(15, 0)
 
 BAR_SECONDS = 300
@@ -364,6 +406,28 @@ def atr_now(prior: pd.DataFrame, frame: pd.DataFrame) -> float | None:
     tr = pd.concat([bars["high"] - bars["low"], (bars["high"] - prev).abs(),
                     (bars["low"] - prev).abs()], axis=1).max(axis=1)
     return float(tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean().iloc[-1])
+
+
+def open_gap_pct(prior: pd.DataFrame | None, frame: pd.DataFrame) -> float | None:
+    """Today's opening gap: |first bar open / previous session's last close - 1|.
+
+    Returns:
+        The gap as a fraction, or None when either price is unavailable.
+    """
+    if prior is None or prior.empty or frame.empty:
+        return None
+    prev_close = float(prior["close"].iloc[-1])
+    today_open = float(frame["open"].iloc[0])
+    if not (math.isfinite(prev_close) and math.isfinite(today_open)) or prev_close <= 0:
+        return None
+    return abs(today_open / prev_close - 1.0)
+
+
+def lot_multiplier(gap: float | None) -> int:
+    """GAP_LOT_MULTIPLIER on a gap day, else 1; an unreadable gap sizes normally."""
+    if gap is not None and gap >= GAP_SIZE_PCT:
+        return max(1, int(GAP_LOT_MULTIPLIER))
+    return 1
 
 
 def index_ltp(client) -> float | None:
@@ -725,14 +789,14 @@ def flatten_unprotected_entry(client, symbol: str, quantity: int, buy_orderid: s
     return how in ("closed", "already-flat")
 
 
-def live_entry(client, leg: dict, spot: float, stop: float) -> dict | None:
-    """Market-buy LIVE_LOTS of the leg, then park the broker-side backstop.
+def live_entry(client, leg: dict, spot: float, stop: float, lots: int = LIVE_LOTS) -> dict | None:
+    """Market-buy `lots` lots of the leg, then park the broker-side backstop.
 
     Returns the fills and order ids for the position dict, or None when
     nothing filled: the signal is dropped rather than retried, exactly as the
     paper book drops a signal it cannot price.
     """
-    qty = int(leg["lotsize"]) * LIVE_LOTS
+    qty = int(leg["lotsize"]) * int(lots)
     try:
         r = client.placeorder(strategy=STRATEGY_TAG, symbol=leg["symbol"], action="BUY",
                               exchange=FO_EXCHANGE, price_type="MARKET",
@@ -949,6 +1013,212 @@ def live_close(client, pos: dict) -> tuple[str, float | None]:
 # POSITIONS  (one per book)
 # =============================================================================
 
+def initial_legs(stop: float, multiplier: int = 1) -> dict:
+    """The lock and runner legs of a fresh position, both on the entry stop.
+
+    Args:
+        stop: The initial index stop.
+        multiplier: Lot multiplier (GAP_LOT_MULTIPLIER on a gap day).
+    """
+    m = max(1, int(multiplier))
+    runner = max(0, min(RUNNER_LOTS, LIVE_LOTS))
+    legs = {}
+    if LIVE_LOTS - runner > 0:
+        legs["lock"] = {"lots": (LIVE_LOTS - runner) * m, "stop": stop}
+    if runner > 0:
+        legs["runner"] = {"lots": runner * m, "stop": stop}
+    return legs
+
+
+def position_legs(pos: dict) -> dict:
+    """The position's legs; a position saved before the split is one lock leg."""
+    if not pos.get("legs"):
+        pos["legs"] = {"lock": {"lots": int(pos.get("lots") or 1), "stop": float(pos["stop"])}}
+    return pos["legs"]
+
+
+def sync_position(pos: dict) -> None:
+    """Total the open lots and set the position stop to the loosest leg's.
+
+    The SL-M backstop is sized off pos["stop"], so it must be the stop of the
+    leg with the most room; a backstop tighter than a leg's own stop would
+    sell that leg early.
+    """
+    legs = position_legs(pos)
+    long = pos["direction"] == "long"
+    pos["lots"] = sum(int(leg["lots"]) for leg in legs.values())
+    if pos.get("buy_orderid"):
+        pos["qty"] = pos["lots"] * int(pos["lotsize"])
+    stops = [float(leg["stop"]) for leg in legs.values()]
+    if stops:
+        pos["stop"] = min(stops) if long else max(stops)
+
+
+def leg_hits(pos: dict, low: float, high: float) -> list[str]:
+    """Legs whose stop the range [low, high] reached, or whose exit is pending."""
+    long = pos["direction"] == "long"
+    return [n for n, leg in position_legs(pos).items()
+            if leg.get("exit_pending")
+            or ((low <= float(leg["stop"])) if long else (high >= float(leg["stop"])))]
+
+
+def advance_legs(name: str, pos: dict) -> None:
+    """Trail every leg, then apply each leg's ATR lock floor; stops only tighten.
+
+    The floors scale with pos["atr"], the ATR(14) at entry. A position saved
+    without it (opened before the ATR locks) gets the trail only.
+    """
+    long = pos["direction"] == "long"
+    entry = float(pos["entry"])
+    level = trail_level(entry, pos["mfe"], long)
+    atr = pos.get("atr")
+    atr = float(atr) if atr is not None and math.isfinite(float(atr)) and float(atr) > 0 else None
+    for leg_name, leg in position_legs(pos).items():
+        stop = float(leg["stop"])
+        new = stop
+        if level is not None:
+            new = max(new, level) if long else min(new, level)
+        arm_at, lock = ((RUNNER_LOCK_AT_ATR, RUNNER_LOCK_ATR) if leg_name == "runner"
+                        else (LOCK_AT_ATR, LOCK_ATR))
+        if atr is not None and arm_at is not None and pos["mfe"] >= arm_at * atr:
+            floor = entry + lock * atr if long else entry - lock * atr
+            new = max(new, floor) if long else min(new, floor)
+        if BREAKEVEN_AT_PTS is not None and pos["mfe"] >= BREAKEVEN_AT_PTS:
+            new = max(new, entry) if long else min(new, entry)
+        if new != stop:
+            log(f"[{name}] {leg_name} stop: best +{pos['mfe']:.2f} pts, {stop:.2f} -> {new:.2f}")
+            leg["stop"] = new
+    sync_position(pos)
+
+
+def sell_market(client, symbol: str, qty: int) -> tuple[str, float | None]:
+    """Market-sell qty and read the order to a final state."""
+    try:
+        r = client.placeorder(strategy=STRATEGY_TAG, symbol=symbol, action="SELL",
+                              exchange=FO_EXCHANGE, price_type="MARKET",
+                              product=LIVE_PRODUCT, quantity=qty)
+    except Exception as exc:  # noqa: BLE001 - treated as unsettled
+        log(f"LIVE sell raised {exc!r} for {symbol} x{qty}")
+        return "unknown", None
+    if not ok(r):
+        log(f"LIVE sell rejected: {symbol} x{qty}: {r}")
+        return "rejected", None
+    orderid = str(r.get("orderid") or "")
+    try:
+        return wait_order(client, orderid)
+    except Exception as exc:  # noqa: BLE001 - never leave a sell running unwatched
+        log(f"LIVE sell {orderid} unsettled ({exc!r}); cancelling blind")
+        try:
+            client.cancelorder(order_id=orderid, strategy=STRATEGY_TAG)
+        except Exception as cancel_exc:  # noqa: BLE001
+            log(f"cancel of {orderid} failed: {cancel_exc!r}")
+        return "unknown", None
+
+
+def park_backstop(client, pos: dict) -> bool:
+    """Greek-map a fresh SL-M for exactly the lots still open; True when it rests."""
+    spot = index_ltp(client)
+    premium = option_ltp(client, pos["symbol"])
+    long = pos["direction"] == "long"
+    if not spot or not premium:
+        log(f"backstop re-park: no quote for {pos['symbol']}")
+        return False
+    if (spot <= pos["stop"]) if long else (spot >= pos["stop"]):
+        log("backstop re-park: index already beyond the stop")
+        return False
+    trigger = slm_trigger(client, pos["symbol"], premium, spot, float(pos["stop"]))
+    if trigger is None:
+        return False
+    try:
+        sr = client.placeorder(strategy=STRATEGY_TAG, symbol=pos["symbol"], action="SELL",
+                               exchange=FO_EXCHANGE, price_type="SL-M",
+                               product=LIVE_PRODUCT, quantity=int(pos["qty"]),
+                               trigger_price=f"{trigger:.2f}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"backstop re-park raised {exc!r}")
+        return False
+    if not ok(sr) or not sr.get("orderid"):
+        log(f"backstop re-park refused: {sr}")
+        return False
+    pos["slm_orderid"] = str(sr["orderid"])
+    pos["slm_trigger"] = trigger
+    log(f"SL-M backstop re-parked: {pos['qty']} {pos['symbol']} trigger {trigger:.2f} "
+        f"(order {pos['slm_orderid']})")
+    return True
+
+
+def close_legs(client, name: str, book: dict, names: list[str], price: float, why: str,
+               bar_start: str) -> bool:
+    """Close some legs; the whole position when every open leg is named.
+
+    Live, the backstop covers every open lot, so it is cleared first, the
+    legs are sold, and a fresh backstop is parked for the lots left. If that
+    re-park fails the rest is flattened, as an unprotected entry is.
+
+    Returns:
+        True when the named legs are closed.
+    """
+    pos = book["position"]
+    legs = position_legs(pos)
+    if set(names) >= set(legs):
+        return close_position(client, name, book, price, why, bar_start)
+    lots = sum(int(legs[n]["lots"]) for n in names)
+    live = bool(pos.get("buy_orderid"))
+    premium = None
+    if live:
+        slm = pos.get("slm_orderid")
+        if slm:
+            how, fill = release_backstop(client, slm)
+            if how == "filled":
+                pos["slm_orderid"] = None
+                return close_position(client, name, book, price, "backstop", bar_start,
+                                      settled=("already-flat", fill or option_ltp(client, pos["symbol"])))
+            if how == "live":
+                for n in names:
+                    legs[n]["exit_pending"] = True
+                return False
+            pos["slm_orderid"] = None
+        status, fill = sell_market(client, pos["symbol"], lots * int(pos["lotsize"]))
+        if status != "complete":
+            held = net_quantity(client, pos["symbol"])
+            if held is not None and held <= 0:
+                return close_position(client, name, book, price, why, bar_start,
+                                      settled=("outside", option_ltp(client, pos["symbol"])))
+            for n in names:
+                legs[n]["exit_pending"] = True
+            log(f"[{name}] LIVE {'+'.join(names)} exit ({why}) {status}; retrying")
+            if not park_backstop(client, pos):
+                pos["emergency_exit"] = True
+            return False
+        premium = fill or option_ltp(client, pos["symbol"])
+    elif pos.get("symbol"):
+        premium = option_ltp(client, pos["symbol"])
+    long = pos["direction"] == "long"
+    gross = (price - pos["entry"]) if long else (pos["entry"] - price)
+    opt = ""
+    if premium is not None and pos.get("premium_in") is not None:
+        opt_pts = premium - pos["premium_in"]
+        opt = (f"; option {pos['premium_in']:.2f} -> {premium:.2f} "
+               f"({opt_pts:+.2f}, Rs {opt_pts * pos['lotsize']:+,.0f} per lot)")
+    label = "LIVE" if live else "PAPER"
+    log(f"[{name}] {label} EXIT {'+'.join(names)} {why} ({lots} lot): {pos['direction']} "
+        f"{pos['entry']:.2f} -> {price:.2f}, index {gross:+.2f} pts gross{opt}")
+    book["closed"].append({"direction": pos["direction"], "entry": pos["entry"],
+                           "exit": price, "why": f"{why}:{'+'.join(names)}",
+                           "gross": round(gross, 2), "lots": lots,
+                           "stop": min(float(legs[n]["stop"]) for n in names) if long
+                           else max(float(legs[n]["stop"]) for n in names),
+                           "premium_in": pos.get("premium_in"), "premium_out": premium,
+                           "opened": pos["opened"], "closed": datetime.now(IST).isoformat()})
+    for n in names:
+        del legs[n]
+    sync_position(pos)
+    if live and not park_backstop(client, pos):
+        log(f"[{name}] CRITICAL: no backstop for the {pos['lots']} lot(s) left; flattening them")
+        pos["emergency_exit"] = True
+    return True
+
+
 def close_position(client, name: str, book: dict, price: float, why: str,
                    bar_start: str, settled: tuple[str, float | None] | None = None) -> bool:
     """Close the book's position and log index and option results.
@@ -990,6 +1260,7 @@ def close_position(client, name: str, book: dict, price: float, why: str,
         f"{slip}{opt}{note}")
     book["closed"].append({"direction": pos["direction"], "entry": pos["entry"],
                            "exit": price, "why": why, "gross": round(gross, 2),
+                           "lots": int(pos.get("lots") or 1),
                            "stop": pos["stop"], "premium_in": pos.get("premium_in"),
                            "premium_out": premium, "opened": pos["opened"],
                            "closed": datetime.now(IST).isoformat()})
@@ -1063,26 +1334,19 @@ def manage(client, name: str, book: dict, frame: pd.DataFrame) -> None:
     if since.empty:
         return
     last = since.iloc[-1]
-    touched = float(last["low"]) <= pos["stop"] if long else float(last["high"]) >= pos["stop"]
-    if touched:
+    hits = leg_hits(pos, float(last["low"]), float(last["high"]))
+    if hits:
         price = index_ltp(client) or pos["stop"]
-        log(f"[{name}] bar {since.index[-1]:%H:%M} traded through the stop between polls")
-        close_position(client, name, book, price, "stop", next_bar_start(since.index[-1]))
-        return
+        log(f"[{name}] bar {since.index[-1]:%H:%M} traded through the "
+            f"{'+'.join(hits)} stop between polls")
+        if not close_legs(client, name, book, hits, price, "stop", next_bar_start(since.index[-1])):
+            return
+        pos = book.get("position")
+        if not pos:
+            return
     best = (float(since["high"].max()) - pos["entry"]) if long else (pos["entry"] - float(since["low"].min()))
     pos["mfe"] = max(pos.get("mfe", 0.0), best)
-    level = trail_level(pos["entry"], pos["mfe"], long)
-    if level is not None:
-        moved = max(pos["stop"], level) if long else min(pos["stop"], level)
-        if moved != pos["stop"]:
-            log(f"[{name}] trail: best +{pos['mfe']:.2f} pts, stop {pos['stop']:.2f} -> {moved:.2f}")
-            pos["stop"] = moved
-    if BREAKEVEN_AT_PTS is not None and pos["mfe"] >= BREAKEVEN_AT_PTS:
-        moved = max(pos["stop"], pos["entry"]) if long else min(pos["stop"], pos["entry"])
-        if moved != pos["stop"]:
-            log(f"[{name}] breakeven: best +{pos['mfe']:.2f} pts clears {BREAKEVEN_AT_PTS:g}, "
-                f"stop {pos['stop']:.2f} -> {moved:.2f} (entry)")
-            pos["stop"] = moved
+    advance_legs(name, pos)
 
 
 def open_books(state: dict) -> list[tuple[str, dict]]:
@@ -1105,9 +1369,9 @@ def watch_stop(client, state: dict, deadline: float) -> None:
                                next_bar_start(datetime.now(IST)))
                 save_state(state)
                 continue
-            long = pos["direction"] == "long"
-            if (price <= pos["stop"]) if long else (price >= pos["stop"]):
-                close_position(client, name, book, price, "stop", next_bar_start(datetime.now(IST)))
+            hits = leg_hits(pos, price, price)
+            if hits:
+                close_legs(client, name, book, hits, price, "stop", next_bar_start(datetime.now(IST)))
                 save_state(state)
 
 
@@ -1162,6 +1426,7 @@ def cycle(client, state: dict) -> dict:
     if BOOK_BOX_ATR_MAX:
         prior = fetch_prior(client)
         gate_quotes["atr"] = atr_now(prior, frame) if prior is not None else None
+        gate_quotes["gap"] = open_gap_pct(prior, frame)
     legs: dict = {}
     parts = []
     for name, book in books.items():
@@ -1230,21 +1495,33 @@ def cycle(client, state: dict) -> dict:
         leg, premium = legs[opt_type]
         shown = f"{premium:.2f}" if premium is not None else "unknown"
         head = "LIVE signal" if TRADE_LIVE else "PAPER"
+        gap = gate_quotes.get("gap")
+        mult = lot_multiplier(gap)
+        pos_legs = initial_legs(stop, mult)
+        lots = sum(int(x["lots"]) for x in pos_legs.values())
+        gap_text = f"gap {gap:.2%}" if gap is not None else "gap unreadable"
+        size_text = f"{lots} lots ({gap_text}{', gap day x' + str(mult) if mult > 1 else ''})"
+        lock_text = ", ".join(
+            f"{n} floor +{lk * atr:.2f} once +{at * atr:.2f}"
+            for n, (at, lk) in (("lock", (LOCK_AT_ATR, LOCK_ATR)), ("runner", (RUNNER_LOCK_AT_ATR, RUNNER_LOCK_ATR)))
+            if n in pos_legs and at is not None)
         log(f"[{name}] {head} {side.upper()}: close {close:.2f} broke the {sig['candles']}-candle box "
             f"{sig['low']:.2f}-{sig['high']:.2f}; entry {spot:.2f}, stop {stop:.2f} "
-            f"(risk {risk:.2f} pts); {leg['symbol'] if leg else 'option unresolved'} premium {shown}")
+            f"(risk {risk:.2f} pts); {leg['symbol'] if leg else 'option unresolved'} premium {shown}; "
+            f"{size_text}; ATR {atr:.2f}: {lock_text or 'no locks'}")
         position = {
             "direction": side, "entry": spot, "stop": stop, "risk": risk,
             "mfe": 0.0, "opened": now.isoformat(),
             "entry_bar": (bar + timedelta(seconds=BAR_SECONDS)).isoformat(),
             "symbol": leg["symbol"] if leg else None,
             "lotsize": leg["lotsize"] if leg else 0, "premium_in": premium,
+            "legs": pos_legs, "lots": lots, "atr": float(atr), "gap": gap,
         }
         if TRADE_LIVE:
             if not leg:
                 log(f"[{name}] live entry skipped: option unresolved; staying flat")
                 continue
-            fills = live_entry(client, leg, spot, stop)
+            fills = live_entry(client, leg, spot, stop, lots)
             if fills is None:
                 continue            # rejected or unsettled: no position, no trade counted
             position.update(fills)
@@ -1277,13 +1554,14 @@ def summary(state: dict) -> None:
         if not closed:
             log(f"[{name}] day summary: no paper trades")
             continue
-        gross = sum(t["gross"] for t in closed)
+        gross = sum(t["gross"] * int(t.get("lots") or 1) for t in closed)
+        lots = sum(int(t.get("lots") or 1) for t in closed)
         stops = [t for t in closed if t["why"] == "stop"]
         slips = [((t["stop"] - t["exit"]) if t["direction"] == "long" else (t["exit"] - t["stop"]))
                  for t in stops]
         avg_slip = f", average stop slippage {sum(slips) / len(slips):+.2f} pts" if slips else ""
         log(f"[{name}] day summary: {len(closed)} paper trades, index {gross:+.2f} pts gross, "
-            f"{gross - COST_PTS * len(closed):+.2f} after cost{avg_slip}")
+            f"{gross - COST_PTS * lots:+.2f} after cost ({lots} lot exits){avg_slip}")
 
 
 def main() -> int:
@@ -1293,7 +1571,8 @@ def main() -> int:
     client = build_client()
     be_text = (f"breakeven at +{BREAKEVEN_AT_PTS:g} pts" if BREAKEVEN_AT_PTS is not None
                else "breakeven off")
-    mode = (f"LIVE: {LIVE_LOTS} lot {LIVE_PRODUCT} market orders with a broker SL-M "
+    mode = (f"LIVE: {LIVE_LOTS} lot (x{GAP_LOT_MULTIPLIER} on a {GAP_SIZE_PCT:.1%} gap day) "
+            f"{LIVE_PRODUCT} market orders with a broker SL-M "
             "backstop, exit failures retried (Analyze mode routes them to the sandbox); "
             "TRADE_LIVE = False is paper") if TRADE_LIVE else "PAPER ONLY - no order is ever sent"
     log(f"{STRATEGY_TAG} starting, {mode}: "
@@ -1306,7 +1585,8 @@ def main() -> int:
                     if BREADTH_MIN is not None else ", breadth filter off")
     log(f"book: boxatr (VIX > {VIX_MIN:g}{breadth_rule}, box <= "
         f"{BOOK_BOX_ATR_MAX['boxatr']:g}x ATR{ATR_PERIOD}); "
-        f"option {ITM_POINTS} pts ITM")
+        f"option {ITM_POINTS} pts ITM; locks: lock lot +{LOCK_ATR} ATR once +{LOCK_AT_ATR} ATR, "
+        f"runner +{RUNNER_LOCK_ATR} ATR once +{RUNNER_LOCK_AT_ATR} ATR")
 
     state = load_state()
     try:

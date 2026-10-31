@@ -41,6 +41,7 @@ class StubClient:
         self.held = held                    # positionbook quantity; None = unreadable
         self.greeks_ok = True
         self.index_price = 75000.0
+        self.option_price = None            # quote for LEG when set
         self.events: list[str] = []
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
@@ -74,6 +75,8 @@ class StubClient:
     def quotes(self, *, symbol, exchange, **kw):
         if symbol == scb.UNDERLYING and exchange == scb.INDEX_EXCHANGE:
             return {"status": "success", "data": {"ltp": self.index_price}}
+        if symbol == LEG["symbol"] and self.option_price is not None:
+            return {"status": "success", "data": {"ltp": self.option_price}}
         return {"status": "error", "message": "quote unavailable"}
 
     def optiongreeks(self, *, symbol, exchange, **kw):
@@ -143,7 +146,7 @@ def test_live_entry_fills_then_parks_the_backstop():
     assert client.orders[0]["action"] == "BUY"
     slm = placed(client, "SELL", "SL-M")[0]
     assert slm["trigger_price"] == "292.50"  # fill 412.5 less 0.8 delta x 150 index points
-    assert slm["quantity"] == LEG["lotsize"]
+    assert slm["quantity"] == LEG["lotsize"] * scb.LIVE_LOTS
     assert client.events.index("status:BUY1") < client.events.index(f"greeks:{LEG['symbol']}:BFO")
     assert client.events.index(f"greeks:{LEG['symbol']}:BFO") < client.events.index("place:SELL:SL-M")
 
@@ -340,3 +343,182 @@ def test_manage_does_nothing_when_the_book_is_unreadable():
     scb.manage(client, "boxatr", book, no_bars())
     assert book["position"] is not None
     assert client.cancelled == []
+
+
+
+# ----------------------------------------------------------------------------
+# Two-lot split: the lock lot and the runner (2026-11-02)
+# ----------------------------------------------------------------------------
+
+def split_book(live=True, lock_stop=74850.0, runner_stop=74850.0):
+    book = live_book(qty=2 * LEG["lotsize"])
+    pos = book["position"]
+    pos["lots"] = 2
+    pos["legs"] = {"lock": {"lots": 1, "stop": lock_stop},
+                   "runner": {"lots": 1, "stop": runner_stop}}
+    pos["stop"] = min(lock_stop, runner_stop)
+    if not live:
+        for k in ("buy_orderid", "slm_orderid", "qty"):
+            pos.pop(k, None)
+    return book
+
+
+def test_entry_builds_a_lock_leg_and_a_runner():
+    legs = scb.initial_legs(74850.0)
+    assert legs == {"lock": {"lots": scb.LIVE_LOTS - scb.RUNNER_LOTS, "stop": 74850.0},
+                    "runner": {"lots": scb.RUNNER_LOTS, "stop": 74850.0}}
+
+
+def test_gap_day_doubles_both_legs():
+    legs = scb.initial_legs(74850.0, scb.lot_multiplier(scb.GAP_SIZE_PCT))
+    assert legs == {"lock": {"lots": (scb.LIVE_LOTS - scb.RUNNER_LOTS) * scb.GAP_LOT_MULTIPLIER, "stop": 74850.0},
+                    "runner": {"lots": scb.RUNNER_LOTS * scb.GAP_LOT_MULTIPLIER, "stop": 74850.0}}
+
+
+def test_lot_multiplier_only_on_a_gap_day():
+    assert scb.lot_multiplier(None) == 1
+    assert scb.lot_multiplier(scb.GAP_SIZE_PCT - 1e-6) == 1
+    assert scb.lot_multiplier(scb.GAP_SIZE_PCT) == scb.GAP_LOT_MULTIPLIER
+    assert scb.lot_multiplier(0.02) == scb.GAP_LOT_MULTIPLIER
+
+
+def test_open_gap_reads_first_open_against_previous_close():
+    idx_prev = pd.date_range("2026-10-30 15:20", periods=2, freq="5min", tz=scb.IST)
+    prior = pd.DataFrame({"open": [74400.0, 74500.0], "high": [74600.0, 74550.0],
+                          "low": [74300.0, 74450.0], "close": [74500.0, 74000.0]}, index=idx_prev)
+    idx = pd.date_range("2026-11-02 09:15", periods=2, freq="5min", tz=scb.IST)
+    frame = pd.DataFrame({"open": [73630.0, 73700.0], "high": [73800.0, 73750.0],
+                          "low": [73600.0, 73650.0], "close": [73700.0, 73720.0]}, index=idx)
+    assert scb.open_gap_pct(prior, frame) == pytest.approx(0.005)       # down 0.5% from 74000
+    assert scb.lot_multiplier(scb.open_gap_pct(prior, frame)) == scb.GAP_LOT_MULTIPLIER
+    assert scb.open_gap_pct(None, frame) is None
+    assert scb.open_gap_pct(prior, frame.iloc[0:0]) is None
+
+
+def test_live_entry_buys_the_lots_it_is_given():
+    client = StubClient()
+    fills = scb.live_entry(client, LEG, spot=75000.0, stop=74850.0, lots=4)
+    assert fills["qty"] == LEG["lotsize"] * 4
+    assert placed(client, "SELL", "SL-M")[0]["quantity"] == LEG["lotsize"] * 4
+
+
+def test_atr_locks_arm_per_leg_and_the_position_stop_is_the_loosest():
+    book = split_book()
+    pos = book["position"]
+    atr = 50.0
+    pos["atr"] = atr
+    entry = pos["entry"]
+    # past the lock lot's arm, short of the runner's
+    pos["mfe"] = scb.LOCK_AT_ATR * atr + 5
+    scb.advance_legs("boxatr", pos)
+    assert pos["legs"]["lock"]["stop"] == pytest.approx(entry + scb.LOCK_ATR * atr)
+    assert pos["legs"]["runner"]["stop"] < entry
+    assert pos["stop"] == pos["legs"]["runner"]["stop"]
+    # past the runner's arm too
+    pos["mfe"] = scb.RUNNER_LOCK_AT_ATR * atr + 5
+    scb.advance_legs("boxatr", pos)
+    assert pos["legs"]["runner"]["stop"] >= entry + scb.RUNNER_LOCK_ATR * atr
+    assert pos["stop"] == min(pos["legs"]["lock"]["stop"], pos["legs"]["runner"]["stop"])
+
+
+def test_atr_locks_mirror_for_a_short():
+    book = split_book(lock_stop=75150.0, runner_stop=75150.0)
+    pos = book["position"]
+    pos["direction"] = "short"
+    pos["stop"] = 75150.0
+    pos["atr"] = 50.0
+    pos["mfe"] = scb.LOCK_AT_ATR * 50.0 + 5
+    scb.advance_legs("boxatr", pos)
+    assert pos["legs"]["lock"]["stop"] == pytest.approx(pos["entry"] - scb.LOCK_ATR * 50.0)
+    assert pos["legs"]["runner"]["stop"] == 75150.0
+    assert pos["stop"] == 75150.0
+
+
+def test_locks_wait_for_the_arming_move():
+    book = split_book()
+    pos = book["position"]
+    pos["atr"] = 50.0
+    pos["mfe"] = scb.LOCK_AT_ATR * 50.0 - 5
+    scb.advance_legs("boxatr", pos)
+    assert pos["legs"]["lock"]["stop"] < pos["entry"]
+    assert pos["legs"]["runner"]["stop"] < pos["entry"]
+
+
+def test_position_without_entry_atr_trails_only():
+    book = split_book()
+    pos = book["position"]
+    pos.pop("atr", None)
+    pos["mfe"] = 1000.0
+    scb.advance_legs("boxatr", pos)
+    level = scb.trail_level(pos["entry"], 1000.0, True)
+    assert pos["legs"]["lock"]["stop"] == pytest.approx(level)
+    assert pos["legs"]["runner"]["stop"] == pytest.approx(level)
+
+
+def test_paper_lock_leg_exits_alone_and_the_runner_stays():
+    client = StubClient()
+    entry = 75000.0
+    book = split_book(live=False, lock_stop=entry + 30, runner_stop=entry + 10)
+    hits = scb.leg_hits(book["position"], entry + 25, entry + 25)
+    assert hits == ["lock"]
+    assert scb.close_legs(client, "boxatr", book, hits, entry + 30, "stop",
+                          "2026-11-02T11:00:00+05:30") is True
+    pos = book["position"]
+    assert list(pos["legs"]) == ["runner"] and pos["lots"] == 1
+    assert book["closed"][0]["lots"] == 1 and book["closed"][0]["gross"] == pytest.approx(30.0)
+
+
+def test_live_lock_leg_sells_one_lot_and_reparks_the_backstop():
+    client = StubClient(held=2 * LEG["lotsize"])
+    client.option_price = 450.0
+    entry = 75000.0
+    client.index_price = entry + 28
+    book = split_book(lock_stop=entry + 30, runner_stop=entry + 10)
+    assert scb.close_legs(client, "boxatr", book, ["lock"], entry + 28, "stop",
+                          "2026-11-02T11:00:00+05:30") is True
+    pos = book["position"]
+    assert "SLM2" in client.cancelled                       # old backstop cleared first
+    sells = placed(client, "SELL", "MARKET")
+    assert len(sells) == 1 and sells[0]["quantity"] == LEG["lotsize"]
+    slms = placed(client, "SELL", "SL-M")
+    assert slms and slms[-1]["quantity"] == LEG["lotsize"]  # re-parked for the runner only
+    assert pos["qty"] == LEG["lotsize"] and pos["slm_orderid"] == slms[-1]["orderid"]
+    assert not pos.get("emergency_exit")
+    assert client.events.index("place:SELL:MARKET") < client.events.index("place:SELL:SL-M")
+
+
+def test_live_leg_exit_without_a_new_backstop_flattens_the_rest():
+    client = StubClient(held=2 * LEG["lotsize"])      # no option quote: the re-park cannot size
+    entry = 75000.0
+    client.index_price = entry + 28
+    book = split_book(lock_stop=entry + 30, runner_stop=entry + 10)
+    scb.close_legs(client, "boxatr", book, ["lock"], entry + 28, "stop", "2026-11-02T11:00:00+05:30")
+    assert book["position"]["emergency_exit"] is True
+
+
+def test_both_legs_hit_close_the_whole_position_in_one_sell():
+    client = StubClient()
+    book = split_book()
+    pos = book["position"]
+    hits = scb.leg_hits(pos, 74800.0, 74800.0)
+    assert sorted(hits) == ["lock", "runner"]
+    assert scb.close_legs(client, "boxatr", book, hits, 74845.0, "stop",
+                          "2026-11-02T11:00:00+05:30") is True
+    assert book["position"] is None
+    sells = placed(client, "SELL", "MARKET")
+    assert len(sells) == 1 and sells[0]["quantity"] == 2 * LEG["lotsize"]
+    assert book["closed"][0]["lots"] == 2
+
+
+def test_refused_leg_sale_is_retried_and_the_backstop_put_back():
+    client = StubClient(sell_status=("rejected", 0.0), held=2 * LEG["lotsize"])
+    client.option_price = 450.0
+    entry = 75000.0
+    client.index_price = entry + 28
+    book = split_book(lock_stop=entry + 30, runner_stop=entry + 10)
+    assert scb.close_legs(client, "boxatr", book, ["lock"], entry + 28, "stop",
+                          "2026-11-02T11:00:00+05:30") is False
+    pos = book["position"]
+    assert pos["legs"]["lock"]["exit_pending"] is True
+    assert placed(client, "SELL", "SL-M")[-1]["quantity"] == 2 * LEG["lotsize"]
+    assert scb.leg_hits(pos, entry + 50, entry + 60) == ["lock"]   # retried next poll
