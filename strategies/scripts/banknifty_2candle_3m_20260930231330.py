@@ -1,6 +1,7 @@
-"""BANKNIFTY two-candle VWAP + SMA(45) breakdown on 3-minute candles. LIVE.
+"""BANKNIFTY two-candle VWAP + SMA(45) breakdown on 3-minute candles. DRY RUN.
 
-TRADES REAL ORDERS. The signal is read off BANKNIFTY spot (NSE_INDEX); the
+DRY RUN from 2026-11-02 (DRY_RUN = True): orders are resolved and logged, none sent.
+With DRY_RUN = False it TRADES REAL ORDERS. The signal is read off BANKNIFTY spot (NSE_INDEX); the
 order goes to the nearest monthly NFO option ITM_POINTS (200) in the money.
 The rule is short-only, so in practice that leg is always a PE. BANKNIFTY has
 listed monthly expiries only since November 2024.
@@ -147,7 +148,7 @@ DIRECTIONS = ("short",)             # long side removed, see EVIDENCE in the doc
 
 # LIVE TRADING
 I_UNDERSTAND_THIS_IS_LIVE = True    # False refuses real orders outside analyzer mode
-DRY_RUN = False                     # True resolves and logs the orders, places nothing
+DRY_RUN = True                      # dry run from 2026-11-02 (user, 2026-10-31): logs orders, places nothing
 LIVE_BOOK = "plain"                 # plain book trades live; breadth is paper ("breadth" until 2026-10-31)
 PRODUCT = "MIS"                     # intraday, squared off the same session
 LOTS = 1                            # lots sent per live entry
