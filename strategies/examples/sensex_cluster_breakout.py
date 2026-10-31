@@ -1,6 +1,7 @@
 """SENSEX range-cluster breakout, 5-minute candles.
 
-Live from 2026-10-03: with TRADE_LIVE the script sends real orders - a market
+DRY RUN from 2026-11-02 (TRADE_LIVE = False: paper only, no order is sent).
+Live 2026-10-03..10-30: with TRADE_LIVE the script sends real orders - a market
 BUY of LIVE_LOTS of the weekly BFO option ITM_POINTS (100) in the money - CE
 below ATM, PE above; ATM until 2026-09-29. Once the option BUY fills, the
 script reads that contract's broker Greeks, maps the initial index stop to an
@@ -196,7 +197,7 @@ COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 # Live orders. TRADE_LIVE False makes every path paper-only again. Orders
 # follow the platform's Analyze (sandbox) versus Live mode, so this same code
 # can be dry run on the sandbox before real money is at risk.
-TRADE_LIVE = True
+TRADE_LIVE = False                  # dry run from 2026-11-02 (user, 2026-10-31); True sends real orders
 LIVE_LOTS = 2                       # lock + runner; 1 until 2026-10-30; x GAP_LOT_MULTIPLIER on a gap day
 LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
 ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
