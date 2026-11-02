@@ -165,7 +165,7 @@ BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points a
 #   runner lot: once the best move reaches RUNNER_LOCK_AT_ATR (4) x ATR, its
 #               stop is never worse than entry + RUNNER_LOCK_ATR (1) x ATR
 # Each lot exits on its own stop; the SL-M backstop always covers exactly the
-# lots still open. Entries stop at 13:30 (NO_NEW_ENTRY_AFTER): late
+# lots still open. Entries stop at 12:30 (NO_NEW_ENTRY_AFTER): late
 # breakouts were mostly losers. On a gap day, today's open at least
 # GAP_SIZE_PCT (0.4%) from the previous session's close either way, every
 # lot count is multiplied by GAP_LOT_MULTIPLIER (2): 4 lots instead of 2.
@@ -218,7 +218,15 @@ BREADTH_MIN = 2.0
 # VIX floor per gated book; every book not listed here is ungated.
 BOOK_VIX_MIN = {"boxatr": VIX_MIN}
 # Box height cap in ATR(14) multiples, per book; books not listed have none.
-BOOK_BOX_ATR_MAX = {"boxatr": 3.0}
+# 2026-11-02 (user: PF >= 1.3 and win > 50%): cap 3 -> 2 ATR and last entry
+# 13:30 -> 12:30. Replayed 2016-10..2026-10-30 on 1 lot, cost 10 pts:
+#                      trades  win%   PF   net pts  maxDD
+#   box 3, 13:30        1,679  52.4  1.25  +26,087  -3,149
+#   box 2, 12:30        1,116  51.8  1.33  +24,128  -2,021
+# 2016-22 PF 1.16 -> 1.31; 2023-26 PF 1.41 -> 1.36 (win 53%); Oct 2026 PF
+# 1.60 -> 1.91. Box 1.5 / 2.5 worse; 12:00 / 13:00 alike. Revert: 3.0 and
+# 13:30. Reproduce: session acdcf260 scratchpad sx_sweep1.py / sx_check.py.
+BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
 ATR_PERIOD = 14
 ATR_WARMUP_DAYS = 10                # calendar days of prior bars for the ATR
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
@@ -227,7 +235,7 @@ ITM_POINTS = 100                    # strike this far in the money; was ATM unti
 
 SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(9, 30)
-NO_NEW_ENTRY_AFTER = dtime(13, 30)  # 14:30 until 2026-10-31
+NO_NEW_ENTRY_AFTER = dtime(12, 30)  # 13:30 2026-10-31..11-02, 14:30 before
 SQUARE_OFF = dtime(15, 0)
 
 BAR_SECONDS = 300
