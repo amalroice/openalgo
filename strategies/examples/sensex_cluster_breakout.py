@@ -227,6 +227,15 @@ BOOK_VIX_MIN = {"boxatr": VIX_MIN}
 # 1.60 -> 1.91. Box 1.5 / 2.5 worse; 12:00 / 13:00 alike. Revert: 3.0 and
 # 13:30. Reproduce: session acdcf260 scratchpad sx_sweep1.py / sx_check.py.
 BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
+# Breakout-bar confirmation, 2026-11-02 (user: avoid fake breakouts like
+# that day's 09:40 long, which closed 0.34 of the way up its bar under a long
+# upper wick). A long needs the breakout bar to close in the top 40% of its
+# range, a short in the bottom 40%. Replayed 2016-10..2026-10-30 on the box 2
+# / 12:30 rules, 1 lot: win 51.8 -> 52.2%, PF 1.33 -> 1.34, net -2.4%, last
+# 2y PF 1.33 -> 1.35, last 1y 1.55 -> 1.65; every value 0.4-0.7 behaves
+# alike, 0.8 is worse. Next-bar confirmation, breakout distance, bar body,
+# gap and trend-side gates all cost more than they saved. None switches it off.
+MIN_CLOSE_LOCATION = 0.6
 ATR_PERIOD = 14
 ATR_WARMUP_DAYS = 10                # calendar days of prior bars for the ATR
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
@@ -525,6 +534,20 @@ def resolve_leg(client, option_type: str) -> dict | None:
 # =============================================================================
 # SIGNAL
 # =============================================================================
+
+def close_location(bar, long: bool) -> float:
+    """How far toward the breakout side a bar closed, 0 (far end) to 1.
+
+    Args:
+        bar: A completed bar with high, low and close.
+        long: True for an upside breakout (measured from the low).
+    """
+    high, low, close = float(bar["high"]), float(bar["low"]), float(bar["close"])
+    rng = high - low
+    if rng <= 0:
+        return 1.0
+    return (close - low) / rng if long else (high - close) / rng
+
 
 def scan(frame: pd.DataFrame, start: int) -> tuple[dict | None, dict | None]:
     """Walk today's bars from `start` exactly as the backtest does.
@@ -1459,6 +1482,11 @@ def cycle(client, state: dict) -> dict:
             continue
         if book.get("trades", 0) >= MAX_TRADES_PER_DAY:
             log(f"[{name}] {side} breakout skipped: {MAX_TRADES_PER_DAY} trades already today")
+            continue
+        loc = close_location(frame.iloc[-1], side == "long")
+        if MIN_CLOSE_LOCATION is not None and loc < MIN_CLOSE_LOCATION:
+            log(f"[{name}] {side} breakout skipped: bar closed {loc:.2f} of the way to its "
+                f"{'high' if side == 'long' else 'low'}, needs {MIN_CLOSE_LOCATION:g} (wick, likely fake)")
             continue
         if name in BOOK_VIX_MIN:
             if "v" not in gate_quotes:

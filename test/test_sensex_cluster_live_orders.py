@@ -536,3 +536,12 @@ def test_refused_leg_sale_is_retried_and_the_backstop_put_back():
     assert pos["legs"]["lock"]["exit_pending"] is True
     assert placed(client, "SELL", "SL-M")[-1]["quantity"] == 2 * LEG["lotsize"]
     assert scb.leg_hits(pos, entry + 50, entry + 60) == ["lock"]   # retried next poll
+
+
+def test_close_location_measures_toward_the_breakout_side():
+    bar = {"high": 75444.12, "low": 75377.25, "close": 75399.73}   # 2026-11-02 09:40, the fake long
+    assert scb.close_location(bar, True) == pytest.approx(0.336, abs=1e-3)
+    assert scb.close_location(bar, True) < scb.MIN_CLOSE_LOCATION
+    assert scb.close_location(bar, False) == pytest.approx(0.664, abs=1e-3)
+    assert scb.close_location({"high": 100.0, "low": 90.0, "close": 99.0}, True) == pytest.approx(0.9)
+    assert scb.close_location({"high": 100.0, "low": 100.0, "close": 100.0}, False) == 1.0
