@@ -187,18 +187,18 @@ BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points a
 # sxw2.py / sizing.py / tenyr.py.
 LOCK_AT_ATR = 2.0                   # best move, in entry ATRs, that arms the lock lot's floor
 LOCK_ATR = 1.0                      # the lock lot's floor, entry ATRs in profit
-RUNNER_LOTS = 1                     # of LIVE_LOTS, these use the runner's lock
+RUNNER_LOTS = 0                     # of LIVE_LOTS, these use the runner's lock; 0 from 2026-11-02 (1 lot, lock lot rules)
 RUNNER_LOCK_AT_ATR = 4.0            # best move, in entry ATRs, that arms the runner's floor
 RUNNER_LOCK_ATR = 1.0               # the runner's floor, entry ATRs in profit
 GAP_SIZE_PCT = 0.004                # |open / previous close - 1| at or above this is a gap day
-GAP_LOT_MULTIPLIER = 2              # lots multiplied by this on a gap day; 1 switches sizing off
+GAP_LOT_MULTIPLIER = 1              # lots multiplied by this on a gap day; 1 switches sizing off (off from 2026-11-02, user)
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 
 # Live orders. TRADE_LIVE False makes every path paper-only again. Orders
 # follow the platform's Analyze (sandbox) versus Live mode, so this same code
 # can be dry run on the sandbox before real money is at risk.
 TRADE_LIVE = False                  # dry run from 2026-11-02 (user, 2026-10-31); True sends real orders
-LIVE_LOTS = 2                       # lock + runner; 1 until 2026-10-30; x GAP_LOT_MULTIPLIER on a gap day
+LIVE_LOTS = 1                       # 1 lot from 2026-11-02 (user); was 2 (lock + runner) from 2026-10-30
 LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
 ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
 ORDER_POLL_SECONDS = 1

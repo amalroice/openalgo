@@ -363,26 +363,40 @@ def split_book(live=True, lock_stop=74850.0, runner_stop=74850.0):
     return book
 
 
-def test_entry_builds_a_lock_leg_and_a_runner():
+@pytest.fixture
+def two_lot_sizing(monkeypatch):
+    """The 2026-10-31 lock + runner sizing with gap doubling, whatever the live setting."""
+    monkeypatch.setattr(scb, "LIVE_LOTS", 2)
+    monkeypatch.setattr(scb, "RUNNER_LOTS", 1)
+    monkeypatch.setattr(scb, "GAP_LOT_MULTIPLIER", 2)
+
+
+def test_entry_builds_a_lock_leg_and_a_runner(two_lot_sizing):
     legs = scb.initial_legs(74850.0)
-    assert legs == {"lock": {"lots": scb.LIVE_LOTS - scb.RUNNER_LOTS, "stop": 74850.0},
-                    "runner": {"lots": scb.RUNNER_LOTS, "stop": 74850.0}}
+    assert legs == {"lock": {"lots": 1, "stop": 74850.0}, "runner": {"lots": 1, "stop": 74850.0}}
 
 
-def test_gap_day_doubles_both_legs():
+def test_gap_day_doubles_both_legs(two_lot_sizing):
     legs = scb.initial_legs(74850.0, scb.lot_multiplier(scb.GAP_SIZE_PCT))
-    assert legs == {"lock": {"lots": (scb.LIVE_LOTS - scb.RUNNER_LOTS) * scb.GAP_LOT_MULTIPLIER, "stop": 74850.0},
-                    "runner": {"lots": scb.RUNNER_LOTS * scb.GAP_LOT_MULTIPLIER, "stop": 74850.0}}
+    assert legs == {"lock": {"lots": 2, "stop": 74850.0}, "runner": {"lots": 2, "stop": 74850.0}}
 
 
-def test_lot_multiplier_only_on_a_gap_day():
+def test_one_lot_is_a_single_lock_leg_even_on_a_gap_day(monkeypatch):
+    monkeypatch.setattr(scb, "LIVE_LOTS", 1)
+    monkeypatch.setattr(scb, "RUNNER_LOTS", 0)
+    monkeypatch.setattr(scb, "GAP_LOT_MULTIPLIER", 1)
+    legs = scb.initial_legs(74850.0, scb.lot_multiplier(scb.GAP_SIZE_PCT))
+    assert legs == {"lock": {"lots": 1, "stop": 74850.0}}
+
+
+def test_lot_multiplier_only_on_a_gap_day(two_lot_sizing):
     assert scb.lot_multiplier(None) == 1
     assert scb.lot_multiplier(scb.GAP_SIZE_PCT - 1e-6) == 1
     assert scb.lot_multiplier(scb.GAP_SIZE_PCT) == scb.GAP_LOT_MULTIPLIER
     assert scb.lot_multiplier(0.02) == scb.GAP_LOT_MULTIPLIER
 
 
-def test_open_gap_reads_first_open_against_previous_close():
+def test_open_gap_reads_first_open_against_previous_close(two_lot_sizing):
     idx_prev = pd.date_range("2026-10-30 15:20", periods=2, freq="5min", tz=scb.IST)
     prior = pd.DataFrame({"open": [74400.0, 74500.0], "high": [74600.0, 74550.0],
                           "low": [74300.0, 74450.0], "close": [74500.0, 74000.0]}, index=idx_prev)
