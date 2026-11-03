@@ -188,3 +188,29 @@ def test_refused_live_sell_is_not_booked(path, monkeypatch):
     m.close_book(broker, m.LIVE_BOOK, book, 98.8, "stop")
     assert book["exit"] == 98.8
     assert len([o for o in broker.orders if o["action"] == "SELL"]) == 2
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_time_limit_is_1010(path, monkeypatch):
+    if not path.exists():
+        pytest.skip(f"{path.name} is not on this machine")
+    # load() moves SQUARE_OFF out of the way for the other tests; read the file's own value
+    text = path.read_text(encoding="utf-8")
+    assert "SQUARE_OFF = dtime(10, 10)" in text
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_open_trade_closes_at_the_time_limit(path, monkeypatch):
+    m = load(path, monkeypatch)
+    monkeypatch.setattr(m, "TRADE_LIVE", True)
+    monkeypatch.setattr(m, "POSITION_CHECK_SECONDS", 10_000)
+    # stock drifts but never reaches stop (99.0) or target; the time limit has passed
+    broker = Broker(stock_prices=[100.0, 100.3])
+    state = {"pick": {"symbol": "BRITANNIA", "side": "long"}}
+    m.open_books(broker, state, {"side": "long", "symbol": "BRITANNIA", "expiry": "30DEC30"})
+    monkeypatch.setattr(m, "SQUARE_OFF", dtime(0, 0))
+    m.manage(broker, state)
+    for book in state["books"].values():
+        assert book["why"] == "square-off"
+    sells = [o for o in broker.orders if o["action"] == "SELL"]
+    assert len(sells) == 1 and sells[0]["quantity"] == 125
