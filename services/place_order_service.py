@@ -216,7 +216,9 @@ def place_order_with_auth(
         ))
         return False, error_response, 500
 
-    if res.status == 200:
+    # HTTP 200 alone is not success: brokers such as Angel answer 200 with
+    # status false and no order id when they reject at the API layer.
+    if res.status == 200 and order_id:
         order_response_data = {"status": "success", "orderid": order_id}
 
         if emit_event:
@@ -239,10 +241,13 @@ def place_order_with_auth(
         return True, order_response_data, 200
     else:
         message = (
-            response_data.get("message", "Failed to place order")
+            response_data.get("message") or "Failed to place order"
             if isinstance(response_data, dict)
             else "Failed to place order"
         )
+        if isinstance(response_data, dict) and response_data.get("errorcode"):
+            message = f"{message} (errorcode {response_data['errorcode']})"
+        logger.warning(f"placeorder rejected by broker (HTTP {res.status}): {message}")
         error_response = {"status": "error", "message": message}
         bus.publish(OrderFailedEvent(
             mode="live",

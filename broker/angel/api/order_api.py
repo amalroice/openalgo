@@ -229,6 +229,16 @@ def place_order_api(data, auth):
         orderid = response_data.get("data", {}).get("orderid")
     else:
         orderid = None
+    if not orderid:
+        # Angel rejects at the API layer with HTTP 200 + status false and a
+        # message/errorcode (funds, static IP, session...). Nothing reaches the
+        # order book, so this log line is the only record of why.
+        logger.warning(
+            "Angel rejected placeorder %s %s %s: errorcode=%s message=%s",
+            newdata.get("transactiontype"), newdata.get("quantity"),
+            newdata.get("tradingsymbol"), response_data.get("errorcode"),
+            response_data.get("message"),
+        )
     return response, response_data, orderid
 
 
