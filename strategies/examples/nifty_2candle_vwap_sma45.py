@@ -8,7 +8,8 @@ Entry (long; short is the mirror):
     1. Two consecutive candles lie completely above both VWAP and SMA(45) -
        each candle's low is above the higher of the two lines.
     2. The pair is the first of its run: the candle before candle 1 was not
-       itself completely above both lines.
+       itself completely above both lines. (A first-qualifying-pair variant was
+       tested and rejected on 2026-11-05; see latest_signal.)
     3. Candle 2 closes above candle 1's HIGH (a short mirrors it: candle 2
        closes below candle 1's LOW). Clearing candle 1's whole range, not just
        its close, is what makes this a breakout.
@@ -18,9 +19,9 @@ Entry (long; short is the mirror):
     monotonically from -7.58 index points at 09h to +9.89 at 13h; skipping the
     first hour turned that year from -329.7 points to +541.5 and halved the
     drawdown. The full start-time sweep is at NO_NEW_ENTRY_BEFORE.
-    4. India VIX at or above VIX_MIN - OFF since 2026-09-22 night
-       (VIX_MIN = None), replaced by the breadth gate in 6. It was 11 earlier
-       that day, 10 from 2026-09-21, and 12 before that; see VIX_MIN.
+    4. India VIX at or above VIX_MIN (12) - ON again from 2026-11-05. It was
+       off from 2026-09-22 night to 11-05 (replaced by the breadth gate in 6),
+       11 earlier on 09-22, 10 from 2026-09-21, and 12 before that; see VIX_MIN.
     5. SMA(45) on candle 2 has moved in the trade's direction over the last
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
        Added 2026-09-21 over 6 bars, switched off 2026-09-22, back on that
@@ -432,7 +433,19 @@ SQUARE_OFF_RETRY_SECONDS = 20       # exit retry cadence once past SQUARE_OFF
 # Breadth does the regime job; the floor only cost trades. Last month's one
 # extra trade is the 08-26 short, -1,128. Reproduce: session febea895
 # scratchpad nifty_vix_adr.py. Set 11.0 to restore.
-VIX_MIN = None
+#
+# BACK ON at 12 (12.00 and up trades) on 2026-11-05, user's decision, with the
+# original first-of-run entry (rule 2 in the docstring). Replay
+# 2025-11-05..2026-11-05, 2 lots, VIX on the signal bar, net pts both lots:
+#
+#                               trades  win%   PF    net    maxDD
+#     old entry, no VIX           200   57.5  1.33  +1,877  -1,085
+#     new entry, no VIX           337   52.5  1.08    +990  -1,804
+#     new entry, VIX >= 12        234   50.9  1.10    +924  -1,561
+#     old entry, VIX >= 12 (live) 148   57.4  1.41  +1,777    -704
+#
+# Reproduce: session 04a8c93f scratchpad year_bt.py.
+VIX_MIN = 12.0
 
 # Trend filter, added 2026-09-21 on the user's decision: take a long only when
 # SMA(45) on candle 2 is higher than it was SLOPE_BARS candles earlier, a short
@@ -1079,6 +1092,18 @@ def read_breadth(client) -> tuple[int, int] | None:
 # SIGNAL
 # =============================================================================
 
+def _pair_breaks_out(first, second, direction: str) -> bool:
+    """Candle 2 closes beyond candle 1's range: above its high for a long,
+    below its low for a short.
+
+    Returns:
+        True when the pair is a breakout in that direction.
+    """
+    if direction == "long":
+        return bool(second["close"] > first["high"])
+    return bool(second["close"] < first["low"])
+
+
 def latest_signal(frame: pd.DataFrame) -> dict | None:
     """Test the two most recently completed candles for a first-pair breakout.
 
@@ -1099,6 +1124,15 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
             continue
         # The run has to begin at candle 1, so the candle before it must not
         # already have been clear of both lines.
+        #
+        # TESTED AND REJECTED, 2026-11-05: taking the first QUALIFYING pair of
+        # the run instead (candles of the run before candle 1 allowed), which
+        # would have caught 2026-11-05 12:00/12:05. Replay 2025-11-05..
+        # 2026-11-05, 2 lots, net pts both lots: first-of-run +1,877 PF 1.33
+        # maxDD -1,085 (200 trades); first qualifying pair +990 PF 1.08 maxDD
+        # -1,804 (337 trades). It wins strong trends (Oct 2026 +1,078 vs +716)
+        # and loses choppy months. With VIX >= 12 on both: +1,777 PF 1.41 vs
+        # +924 PF 1.10. Reproduce: session 04a8c93f scratchpad year_bt.py.
         if bool(before[flag]) and frame.index[-3].date() == today:
             continue
         # Candle 2 must close clear of candle 1's RANGE, not merely its close:
@@ -1115,9 +1149,7 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
         # win rate 33.7% -> 36.6%. The last two years give up 46 points; in
         # exchange 2018-2021 stops losing for the first time under any rule
         # tested here, and the full-window drawdown more than halves.
-        if direction == "long" and second["close"] <= first["high"]:
-            continue
-        if direction == "short" and second["close"] >= first["low"]:
+        if not _pair_breaks_out(first, second, direction):
             continue
         if SLOPE_BARS:
             slope = float(second.get("sma_slope", float("nan")))
