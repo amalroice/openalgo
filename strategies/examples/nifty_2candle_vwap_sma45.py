@@ -155,6 +155,30 @@ LOTS = 2                            # 1 until 2026-10-30; 2 from 2026-11-02 for 
 # 2023 lose). Reproduce: session bb9420a2 scratchpad nf_twolot.py.
 RUNNER_LOTS = 1                     # of LOTS, these only go to breakeven; 0 locks every lot
 RUNNER_LOCK_PTS = 0.0               # the runner's floor once BREAKEVEN_AT_PTS is reached
+# Runner EMA exit, user's request 2026-11-06: once the breakeven lock has fired
+# (the lock leg is locked at +BREAKEVEN_LOCK_PTS), the runner stops riding the
+# percent trail and is sold at market the first time a completed bar CLOSES
+# beyond EMA(RUNNER_EMA_PERIOD) against the trade: below it for a long, above
+# it for a short. The check starts on the bar after the lock fires. The runner
+# gets no breakeven floor (user's choice 2026-11-06: on that day the floor sold
+# it on a wick to entry at 12:55, while EMA-only held it from +0 to +190 pts by
+# 14:40), so it can close at a small loss; its entry stop (candle 1 -10) stays
+# as the crash stop and the broker backstop.
+#
+# Started as EMA13; 21 chosen by the user the same day from this replay
+# (2016-10..2026-10-30, live rules incl. VIX >= 12, exits at the bar close,
+# 3 pts a lot, both lots, points per lot):
+#
+#                      10y            2023+          last 2y        2026 YTD
+#   old (BE + trail)   +2,420 1.05    +4,493 1.29    +3,268 1.36    +1,814 1.46
+#   EMA13              +2,753 1.06    +3,949 1.24    +2,512 1.26    +1,768 1.42
+#   EMA21              +4,976 1.10    +5,207 1.30    +3,127 1.31    +2,125 1.47
+#
+# EMA21 costs win rate (last 2y 48.5% vs 54.6%) and drawdown (-Rs 64.8k vs
+# -50.9k last 2y); 21 was the best of only 9/13/21 tried, so it is partly fit.
+# Reproduce: session f069ef87 scratchpad nf_ema_runner.py (on bb9420a2's
+# nf_research frame). None restores the breakeven floor and percent trail.
+RUNNER_EMA_PERIOD = 21
 
 # Percent trailing stop, replacing 1-lot booking at +1.5R (+1R when the stop was
 # over 30 pts) and the line trail on 2026-09-18. With nothing booked, the
@@ -1007,6 +1031,9 @@ def build_frame(client) -> pd.DataFrame:
     combined["sma"] = combined["close"].rolling(SMA_PERIOD).mean()
     if SLOPE_BARS:
         combined["sma_slope"] = combined["sma"] - combined["sma"].shift(SLOPE_BARS)
+    # The runner's EMA also spans prior sessions, so it is warm at the open.
+    if RUNNER_EMA_PERIOD:
+        combined["ema"] = combined["close"].ewm(span=RUNNER_EMA_PERIOD, adjust=False).mean()
     is_today = [stamp.date() == today for stamp in combined.index]
 
     frame = combined[is_today].copy()
@@ -1962,7 +1989,8 @@ def shrink_legs(position: dict, lots_left: int) -> None:
     sync_position(position)
 
 
-def exit_legs(client, state: dict, names: list[str], spot: float) -> dict:
+def exit_legs(client, state: dict, names: list[str], spot: float,
+              why: str = "stop hit") -> dict:
     """Sell some legs of the position and re-park the backstop for the rest.
 
     The resting stop covers every open lot, so it is cleared first (never
@@ -1993,7 +2021,7 @@ def exit_legs(client, state: dict, names: list[str], spot: float) -> dict:
         log(f"{'+'.join(names)} exit {status}; retrying next bar")
     else:
         shown = f" at {fill:.2f}" if fill else ""
-        log(f"{'+'.join(names)} stop hit; sold {qty}{shown}, "
+        log(f"{'+'.join(names)} {why}; sold {qty}{shown}, "
             f"{position['lots_open'] - lots} lot(s) still open")
         for n in names:
             del legs[n]
@@ -2015,14 +2043,18 @@ def advance_leg_stop(name: str, stop: float, position: dict, entry: float,
             log(f"{tag}{what}: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
             stop = moved
 
-    level = trail_level(entry, position["mfe"], long)
+    # With the EMA exit on, the runner neither trails nor moves to breakeven:
+    # the EMA close is its exit and its entry stop stays only as the crash stop.
+    ema_owns_runner = name == "runner" and RUNNER_EMA_PERIOD
+    level = None if ema_owns_runner else trail_level(entry, position["mfe"], long)
     if level is not None:
         tighten(level, "trail")
     risk = float(position.get("risk") or 0.0)
     if LOCK_AT_R is not None and risk > 0 and position["mfe"] >= LOCK_AT_R * risk:
         tighten(entry + LOCK_TO_R * risk if long else entry - LOCK_TO_R * risk,
                 f"lock +{LOCK_TO_R}R")
-    if BREAKEVEN_AT_PTS is not None and position["mfe"] >= BREAKEVEN_AT_PTS:
+    if BREAKEVEN_AT_PTS is not None and position["mfe"] >= BREAKEVEN_AT_PTS \
+            and not ema_owns_runner:
         lock = RUNNER_LOCK_PTS if name == "runner" else BREAKEVEN_LOCK_PTS
         tighten(entry + lock if long else entry - lock,
                 f"breakeven at +{BREAKEVEN_AT_PTS:.0f} (entry {lock:+.0f})")
@@ -2119,12 +2151,37 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
             return exit_position(client, state, f"CLOSE STOP: candle closed {close:.2f} "
                                  f"beyond candle 1's {side} {extreme:.2f}")
 
+    # Runner EMA exit: armed on an earlier bar, so this close is the first one
+    # judged after the lock fired. The runner alone left means the whole position.
+    if RUNNER_EMA_PERIOD and position.get("ema_armed") and "runner" in legs:
+        ema = bar.get("ema")
+        close = float(bar["close"])
+        if ema is not None and not pd.isna(ema) and \
+                ((close < float(ema)) if long else (close > float(ema))):
+            why = (f"RUNNER EMA EXIT: candle closed {close:.2f} "
+                   f"{'below' if long else 'above'} EMA({RUNNER_EMA_PERIOD}) {float(ema):.2f}")
+            if len(legs) == 1:
+                return exit_position(client, state, why)
+            state = exit_legs(client, state, ["runner"], close, why=why)
+            position = state.get("position")
+            if not position:
+                return state
+            legs = position_legs(position)
+
     # Ratchet each leg's stop behind the best price. A stop only ever moves in
     # the trade's favour, and is checked against the NEXT bar, as the backtest
     # does. The lock leg and the runner differ only at the breakeven step.
     for name, leg in legs.items():
         leg["stop"] = advance_leg_stop(name, float(leg["stop"]), position, entry, long)
     sync_position(position)
+
+    # The lock leg is locked once breakeven fires; from the next bar the runner
+    # is judged on its close against the EMA instead of the percent trail.
+    if (RUNNER_EMA_PERIOD and "runner" in legs and not position.get("ema_armed")
+            and BREAKEVEN_AT_PTS is not None and position["mfe"] >= BREAKEVEN_AT_PTS):
+        position["ema_armed"] = True
+        log(f"[runner] lock leg locked; runner now exits on a close "
+            f"{'below' if long else 'above'} EMA({RUNNER_EMA_PERIOD})")
 
     # A stop that failed to park at entry is retried every bar until it rests;
     # one that is resting is raised behind the in-process stop.

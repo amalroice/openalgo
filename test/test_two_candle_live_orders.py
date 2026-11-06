@@ -318,6 +318,8 @@ def test_split_moves_the_lock_leg_to_profit_and_the_runner_to_entry(path, monkey
     strat = load(path, monkeypatch)
     needs_split(strat)
     monkeypatch.setattr(strat, "BROKER_STOP", False)
+    # the runner's breakeven floor applies only with the EMA exit off
+    monkeypatch.setattr(strat, "RUNNER_EMA_PERIOD", None, raising=False)
     state = two_lot_state(strat)
     entry = state["position"]["entry"]
     run = strat.BREAKEVEN_AT_PTS + 5
@@ -327,6 +329,86 @@ def test_split_moves_the_lock_leg_to_profit_and_the_runner_to_entry(path, monkey
     assert legs["runner"]["stop"] == pytest.approx(entry + strat.RUNNER_LOCK_PTS)
     # the position stop - what the broker backstop mirrors - is the loosest leg
     assert state["position"]["stop"] == pytest.approx(entry + strat.RUNNER_LOCK_PTS)
+
+
+def needs_ema_runner(strat):
+    needs_split(strat)
+    if not getattr(strat, "RUNNER_EMA_PERIOD", None):
+        pytest.skip("runner EMA exit is off in this copy")
+
+
+def ema_bar(high: float, low: float, close: float, ema: float):
+    frame = nifty_bar(high, low, close)
+    frame["ema"] = ema
+    return frame
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_ema_runner_keeps_its_entry_stop_and_ignores_a_wick_to_entry(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_ema_runner(strat)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    state = two_lot_state(strat)
+    entry, stop0 = state["position"]["entry"], state["position"]["stop"]
+    run = strat.BREAKEVEN_AT_PTS + 5
+    broker = Broker(held=130)
+    # the run arms the EMA exit; the lock leg locks, the runner does not move
+    state = strat.manage(broker, state, ema_bar(entry + run, entry + 20, entry + run - 5, entry - 30))
+    pos = state["position"]
+    assert pos["ema_armed"]
+    assert pos["legs"]["lock"]["stop"] == pytest.approx(entry + strat.BREAKEVEN_LOCK_PTS)
+    assert pos["legs"]["runner"]["stop"] == pytest.approx(stop0)
+    # a wick through entry sells the lock leg only; the close holds above the EMA
+    state = strat.manage(broker, state, ema_bar(entry + 20, entry - 3, entry + 10, entry - 20))
+    pos = state["position"]
+    assert pos is not None and list(pos["legs"]) == ["runner"]
+    assert len(broker.market("SELL")) == 1
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_ema_runner_exits_on_a_close_below_the_ema(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_ema_runner(strat)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    state = two_lot_state(strat)
+    entry = state["position"]["entry"]
+    run = strat.BREAKEVEN_AT_PTS + 5
+    broker = Broker(held=130)
+    state = strat.manage(broker, state, ema_bar(entry + run, entry + 20, entry + run - 5, entry - 30))
+    # close below the EMA while the lock leg's +15 holds: the runner alone goes
+    state = strat.manage(broker, state, ema_bar(entry + 40, entry + 18, entry + 19, entry + 21))
+    pos = state["position"]
+    assert pos is not None and list(pos["legs"]) == ["lock"]
+    sells = broker.market("SELL")
+    assert len(sells) == 1 and sells[0]["quantity"] == 65
+    # with the runner the last leg, an EMA close flattens the position
+    state = two_lot_state(strat)
+    state["position"]["legs"].pop("lock")
+    state["position"]["lots_open"] = 1
+    state["position"]["ema_armed"] = True
+    state = strat.manage(Broker(held=65), state, ema_bar(entry + 10, entry - 5, entry - 2, entry + 1))
+    assert state["position"] is None
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_ema_runner_mirrors_for_a_short(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    needs_ema_runner(strat)
+    monkeypatch.setattr(strat, "BROKER_STOP", False)
+    state = two_lot_state(strat)
+    pos = state["position"]
+    entry = pos["entry"]
+    pos["direction"] = "short"
+    pos["stop"] = entry + 70
+    for leg in pos["legs"].values():
+        leg["stop"] = entry + 70
+    run = strat.BREAKEVEN_AT_PTS + 5
+    broker = Broker(held=130)
+    state = strat.manage(broker, state, ema_bar(entry - 20, entry - run, entry - run + 5, entry + 30))
+    assert state["position"]["legs"]["runner"]["stop"] == pytest.approx(entry + 70)
+    # close above the EMA, under the lock leg's -15 stop: runner out, lock stays
+    state = strat.manage(broker, state, ema_bar(entry - 18, entry - 40, entry - 19, entry - 21))
+    assert list(state["position"]["legs"]) == ["lock"]
 
 
 @pytest.mark.parametrize("path", NIFTY_PATHS)
