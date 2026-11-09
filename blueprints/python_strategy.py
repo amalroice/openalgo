@@ -1322,6 +1322,20 @@ def is_within_schedule_time(strategy_id: str) -> bool:
         return False
 
 
+def _started_today(config: dict, now: datetime) -> bool:
+    """Whether the strategy's last_started falls on today's IST date."""
+    last_started = config.get("last_started")
+    if not last_started:
+        return False
+    try:
+        started = datetime.fromisoformat(last_started)
+    except (TypeError, ValueError):
+        return False
+    if started.tzinfo is None:
+        started = IST.localize(started)
+    return started.astimezone(IST).date() == now.date()
+
+
 def market_hours_enforcer():
     """
     Per-minute exchange-aware enforcer. For each scheduled strategy:
@@ -1375,6 +1389,28 @@ def market_hours_enforcer():
                             started_count += 1
                         else:
                             logger.warning(f"Failed to resume {strategy_id}: {msg}")
+
+                # Catch up a missed scheduled start. The start cron keeps a
+                # one-second misfire grace, so a host that comes up after
+                # schedule_start (app launched at 09:03 for a 09:00 job) would
+                # otherwise skip the whole day. Start once per day only: a
+                # strategy that already ran today and exited on its own (a
+                # one-trade-a-day script) or crashed is left alone.
+                if (
+                    not config.get("manually_stopped")
+                    and (not schedule_days or today_day in schedule_days)
+                    and not _started_today(config, now)
+                    and not _is_strategy_running(strategy_id, config)
+                    and is_within_schedule_time(strategy_id)
+                ):
+                    logger.info(
+                        f"Enforcer: catching up missed scheduled start for {strategy_id} ({exch})"
+                    )
+                    success, msg = start_strategy_process(strategy_id)
+                    if success:
+                        started_count += 1
+                    else:
+                        logger.warning(f"Catch-up start failed for {strategy_id}: {msg}")
 
                 if "paused_reason" in config:
                     del config["paused_reason"]
