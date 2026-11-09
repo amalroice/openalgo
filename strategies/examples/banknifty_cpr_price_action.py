@@ -1,7 +1,7 @@
-"""BANKNIFTY CPR price action on 5-minute candles, 200-pt ITM monthly options. DRY RUN.
+"""BANKNIFTY CPR price action on 5-minute candles, 200-pt ITM monthly options. LIVE from 2026-11-11.
 
-DRY RUN from 2026-11-09 (DRY_RUN = True): every order is resolved and logged,
-none is sent. With DRY_RUN = False it TRADES REAL ORDERS. Signals are read off
+LIVE from 2026-11-11 (DRY_RUN = False, user 2026-11-09): REAL ORDERS are sent.
+With DRY_RUN = True every order is only resolved and logged. Signals are read off
 BANKNIFTY spot (NSE_INDEX); the order goes to the nearest monthly NFO option
 ITM_POINTS (200) in the money - a CE for a long, a PE for a short. Every stop
 and target is in INDEX points.
@@ -162,7 +162,7 @@ INDEX_EXCHANGE = "NSE_INDEX"
 FO_EXCHANGE = "NFO"
 
 I_UNDERSTAND_THIS_IS_LIVE = True    # False refuses real orders outside analyzer mode
-DRY_RUN = True                      # logs orders, places nothing (user, 2026-11-06: dry run first)
+DRY_RUN = False                     # live from 2026-11-11 (user, 2026-11-09); True logs orders and places nothing
 PRODUCT = "MIS"
 LOTS = 1
 ITM_POINTS = 200                    # strike this far in the money
