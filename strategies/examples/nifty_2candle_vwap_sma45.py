@@ -32,6 +32,8 @@ Entry (long; short is the mirror):
        multiquotes when the signal fires. Added 2026-09-22 at 1.5x; OFF from
        2026-11-02 (ADR_MIN = None) so the strategy trades 3+ days a week.
        See ADR_MIN.
+    7. Candle 2's high-low range is at most MAX_SIGNAL_BAR_PTS (50) index
+       points. Added 2026-11-10; see MAX_SIGNAL_BAR_PTS.
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -470,6 +472,23 @@ SQUARE_OFF_RETRY_SECONDS = 20       # exit retry cadence once past SQUARE_OFF
 #
 # Reproduce: session 04a8c93f scratchpad year_bt.py.
 VIX_MIN = 12.0
+
+# Signal-candle length cap, added 2026-11-10 on the user's decision after the
+# 2026-11-09 10:40 short (candle 2 spanned ~57 pts, stop 94 pts away, both lots
+# stopped, Rs -7,572). A signal whose candle 2 high-low range is longer than
+# this many index points is skipped. Replay 2016-10..2026-11-09 on the live
+# rules (VIX >= 12, 2 lots, lock +25 -> +15, EMA21 runner), Rs = pts x 65 net
+# of 3 pts a lot:
+#
+#                     2016-22          2023-26          last 2y          last 1y
+#     off             -22.0k PF 0.99  +340.2k PF 1.30   +189.4k PF 1.28  +136.6k PF 1.41
+#     <= 50 pts      -125.9k PF 0.94  +377.4k PF 1.38   +259.9k PF 1.46  +187.0k PF 1.70
+#
+# Better in every window from 2023 on, WORSE over 2016-22: treat it as a
+# recent-market rule and recheck it. 45-60 all beat "off" from 2023 on.
+# Reproduce: session a3a805f3 scratchpad nf_lossday.py / nf_step4.py.
+# None switches it off.
+MAX_SIGNAL_BAR_PTS = 50.0
 
 # Trend filter, added 2026-09-21 on the user's decision: take a long only when
 # SMA(45) on candle 2 is higher than it was SLOPE_BARS candles earlier, a short
@@ -1190,9 +1209,17 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
             "c1_low": float(first["low"]),
             "c1_high": float(first["high"]),
             "line": float(first["upper"] if direction == "long" else first["lower"]),
+            "c2_range": float(second["high"]) - float(second["low"]),
             "signal_bar": frame.index[-1].isoformat(),
         }
     return None
+
+
+def signal_bar_too_long(sig: dict) -> bool:
+    """True when candle 2's high-low range exceeds MAX_SIGNAL_BAR_PTS."""
+    if MAX_SIGNAL_BAR_PTS is None:
+        return False
+    return float(sig.get("c2_range", 0.0)) > MAX_SIGNAL_BAR_PTS
 
 
 def trail_level(entry: float, mfe: float, long: bool) -> float | None:
@@ -2268,6 +2295,11 @@ def cycle(client, state: dict) -> dict:
     if not sig:
         return state
 
+    if signal_bar_too_long(sig):
+        log(f"{sig['direction']} signal skipped: candle 2 spans {sig['c2_range']:.2f} pts, "
+            f"above MAX_SIGNAL_BAR_PTS {MAX_SIGNAL_BAR_PTS}")
+        return state
+
     if VIX_MIN is not None:
         vix = read_vix(client)
         if vix is None:
@@ -2444,7 +2476,7 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
-    log(f"filters: VIX >= {VIX_MIN}, SMA slope over {SLOPE_BARS} bars, "
+    log(f"filters: VIX >= {VIX_MIN}, candle 2 <= {MAX_SIGNAL_BAR_PTS} pts, SMA slope over {SLOPE_BARS} bars, "
         f"advance-decline >= {ADR_MIN}x; "
         f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts "
         f"locks +{BREAKEVEN_LOCK_PTS} pts; {LOTS} lots, {RUNNER_LOTS} runner at "

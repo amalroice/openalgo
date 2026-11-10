@@ -480,3 +480,16 @@ def test_hand_sold_lot_comes_off_the_lock_leg_first(path, monkeypatch):
     strat.shrink_legs(state["position"], 1)
     assert list(state["position"]["legs"]) == ["runner"]
     assert state["position"]["lots_open"] == 1
+
+
+@pytest.mark.parametrize("path", NIFTY_PATHS)
+def test_signal_bar_longer_than_the_cap_is_skipped(path, monkeypatch):
+    strat = load(path, monkeypatch)
+    if not hasattr(strat, "signal_bar_too_long"):
+        pytest.skip("this copy predates the signal-bar cap")
+    monkeypatch.setattr(strat, "MAX_SIGNAL_BAR_PTS", 50.0)
+    assert strat.signal_bar_too_long({"c2_range": 57.15})
+    assert not strat.signal_bar_too_long({"c2_range": 50.0})
+    assert not strat.signal_bar_too_long({"c2_range": 21.4})
+    monkeypatch.setattr(strat, "MAX_SIGNAL_BAR_PTS", None)
+    assert not strat.signal_bar_too_long({"c2_range": 120.0})
