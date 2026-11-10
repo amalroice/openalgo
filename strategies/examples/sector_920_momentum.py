@@ -1,5 +1,15 @@
 """Sector-heatmap 09:20 momentum, traded with the stock's ATM option. LIVE from 2026-11-09 (book 1.5R).
 
+From 2026-11-11 the 09:20 pick is no longer bought at 09:21. It is bought at
+CONFIRM_TIME (10:15) only if, since the 09:20 snapshot, the stock has moved at
+least CONFIRM_PCT (0.5%) further in the trade's direction AND NIFTY has moved
+the same way. Otherwise there is no trade that day. Stop, target, psychological
+rule and 15:15 square-off are unchanged and are measured from the 10:15 price.
+Backtest (stock version, 2021-01..2026-10, 0.05% cost): the 09:21 entry
+n 1330 win 42.0% PF 0.84; the 10:15 confirmation n 237 win 54.9% PF 1.37,
+expectancy / average loss +0.17, PF 1.28 / 1.41 / 1.79 in 2021-23 / 2024-25 /
+2026. It trades on about one day in six.
+
 From 2026-11-04 the trade is one lot of the picked stock's ATM option instead
 of the stock: a CE for a long, a PE for a short. Every entry and exit decision
 is still read off the STOCK's own price, never the option's: the option only
@@ -20,7 +30,7 @@ Order of work each day (the user's, 2026-11-03):
        It must be green for a long, red for a short.
     3. Lot size: read from the option contract itself (every stock differs,
        e.g. BRITANNIA 125, WIPRO 3000), so one lot is always one exchange lot.
-    4. Option: at ENTRY_TIME (09:21) the ATM strike (the listed strike nearest
+    4. Option: at CONFIRM_TIME (10:15; 09:21 before 2026-11-11), once confirmed, the ATM strike (the listed strike nearest
        the stock's price), nearest expiry AFTER today, is bought for LOTS (1)
        lot: CE for a long, PE for a short.
     5. Levels, on the STOCK price at entry: stop STOP_PCT (1%) against the
@@ -83,8 +93,10 @@ OPTION_EXCHANGE = "NFO"
 INDEX_SYMBOL, INDEX_EXCHANGE = "NIFTY", "NSE_INDEX"
 
 SNAPSHOT_TIME = dtime(9, 20)
-ENTRY_TIME = dtime(9, 21)
-LATEST_ENTRY = dtime(9, 25)         # a late start after this skips the day
+PICK_LATEST = dtime(9, 25)          # a start after this with no 09:20 pick on record skips the day
+CONFIRM_TIME = dtime(10, 15)        # entry, only if the move since 09:20 is confirmed (from 2026-11-11)
+CONFIRM_PCT = 0.5                   # stock must be at least this % beyond its 09:20 price, with the trade
+LATEST_ENTRY = dtime(10, 20)        # no confirmation read by then skips the day
 SQUARE_OFF = dtime(15, 15)         # MIS square-off; was a 10:10 time limit 2026-11-03..11-10
 
 MAX_MOVE_PCT = 4.0
@@ -195,8 +207,11 @@ def load_sectors() -> dict[str, list[str]]:
     return {s["name"]: [x["symbol"] for x in s["stocks"]] for s in raw["sectors"]}
 
 
-def changes(client, symbols: list[tuple[str, str]]) -> dict[str, float]:
-    """% change from the previous close for each (symbol, exchange); unreadable ones are left out."""
+def changes(client, symbols: list[tuple[str, str]], ltps: dict | None = None) -> dict[str, float]:
+    """% change from the previous close for each (symbol, exchange); unreadable ones are left out.
+
+    When ltps is given, each readable symbol's last price is also stored in it.
+    """
     try:
         q = client.multiquotes(symbols=[{"symbol": s, "exchange": e} for s, e in symbols])
     except Exception as exc:  # noqa: BLE001 - a blip must not stop the strategy
@@ -214,6 +229,8 @@ def changes(client, symbols: list[tuple[str, str]]) -> dict[str, float]:
             continue
         if ltp > 0 and prev > 0:
             out[item.get("symbol")] = (ltp / prev - 1) * 100
+            if ltps is not None:
+                ltps[item.get("symbol")] = ltp
     return out
 
 
@@ -307,11 +324,14 @@ def pick(client, sectors: dict[str, list[str]]) -> dict | None:
 
     Returns:
         {"side", "sector", "sector_pct", "symbol", "stock_pct", "nifty_pct",
-        "expiry"} or None when there is no trade today.
+        "expiry", "ref_price", "nifty_ref"} or None when there is no trade today.
+        ref_price / nifty_ref are the 09:20 last prices the 10:15 confirmation
+        is measured from.
     """
     stocks = sorted({s for members in sectors.values() for s in members})
-    nifty = changes(client, [(INDEX_SYMBOL, INDEX_EXCHANGE)]).get(INDEX_SYMBOL)
-    pct = changes(client, [(s, STOCK_EXCHANGE) for s in stocks])
+    prices: dict[str, float] = {}
+    nifty = changes(client, [(INDEX_SYMBOL, INDEX_EXCHANGE)], prices).get(INDEX_SYMBOL)
+    pct = changes(client, [(s, STOCK_EXCHANGE) for s in stocks], prices)
     if nifty is None:
         log("NIFTY unreadable; no trade today")
         return None
@@ -350,9 +370,43 @@ def pick(client, sectors: dict[str, list[str]]) -> dict | None:
             log(f"skip {s} {p:+.2f}%: no listed NFO options")
             continue
         return {"side": "long" if side == 1 else "short", "sector": sector, "sector_pct": score,
-                "symbol": s, "stock_pct": p, "nifty_pct": nifty, "expiry": expiry}
+                "symbol": s, "stock_pct": p, "nifty_pct": nifty, "expiry": expiry,
+                "ref_price": prices.get(s), "nifty_ref": prices.get(INDEX_SYMBOL)}
     log(f"no {sector} F&O stock moved 0-{MAX_MOVE_PCT:g}% in NIFTY's direction; no trade today")
     return None
+
+
+def confirm(client, choice: dict) -> float | None:
+    """10:15: the stock's entry price if the 09:20 move is confirmed, else None.
+
+    Confirmed means the stock is at least CONFIRM_PCT beyond its 09:20 price in
+    the trade's direction and NIFTY is beyond its 09:20 level the same way.
+    Prices are re-read until LATEST_ENTRY if a quote is missing.
+    """
+    ref, nifty_ref = choice.get("ref_price"), choice.get("nifty_ref")
+    if not ref or not nifty_ref:
+        log(f"no 09:20 reference price for {choice['symbol']} or NIFTY; no trade today")
+        return None
+    side = 1 if choice["side"] == "long" else -1
+    stock = nifty = None
+    while not _shutdown and datetime.now(IST).time() <= LATEST_ENTRY:
+        stock = ltp(client, choice["symbol"])
+        nifty = ltp(client, INDEX_SYMBOL, INDEX_EXCHANGE)
+        if stock is not None and nifty is not None:
+            break
+        time.sleep(2)
+    if stock is None or nifty is None:
+        log(f"no {choice['symbol']} / NIFTY price by {LATEST_ENTRY:%H:%M}; no trade today")
+        return None
+    stock_move = side * (stock / ref - 1) * 100
+    nifty_move = side * (nifty / nifty_ref - 1) * 100
+    log(f"confirmation: {choice['symbol']} {ref:.2f} -> {stock:.2f} ({stock_move:+.2f}% with the trade, "
+        f"needs {CONFIRM_PCT:g}%), NIFTY {nifty_ref:.2f} -> {nifty:.2f} ({nifty_move:+.2f}% with the trade, "
+        f"needs > 0)")
+    if stock_move < CONFIRM_PCT or nifty_move <= 0:
+        log("09:20 move not confirmed; no trade today")
+        return None
+    return stock
 
 
 def levels(entry: float, long: bool, target_pct: float) -> tuple[float, float, str]:
@@ -646,9 +700,8 @@ def manage(client, state: dict) -> None:
         time.sleep(POLL_SECONDS)
 
 
-def open_books(client, state: dict, choice: dict) -> bool:
-    """09:21: read the stock, resolve its ATM option and lot size, open the books."""
-    entry = None
+def open_books(client, state: dict, choice: dict, entry: float | None = None) -> bool:
+    """Entry: take the stock price (the confirmed one when given), resolve its ATM option, open the books."""
     while not _shutdown and entry is None and datetime.now(IST).time() <= LATEST_ENTRY:
         entry = ltp(client, choice["symbol"])
         if entry is None:
@@ -709,7 +762,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     client = build_client()
     mode = f"LIVE book {LIVE_BOOK}" if TRADE_LIVE else "DRY RUN - no order is ever sent"
-    log(f"{STRATEGY_TAG} starting, {mode}: snapshot {SNAPSHOT_TIME:%H:%M}, entry {ENTRY_TIME:%H:%M} "
+    log(f"{STRATEGY_TAG} starting, {mode}: snapshot {SNAPSHOT_TIME:%H:%M}, entry {CONFIRM_TIME:%H:%M} "
+        f"only if the stock is {CONFIRM_PCT:g}%+ beyond its 09:20 price and NIFTY agrees, "
         f"with {LOTS} lot of the stock's ATM option (CE long / PE short, nearest expiry after today), "
         f"exits on the stock price: stop {STOP_PCT:g}%, books " +
         ", ".join(f"{n} target {t:g}%" for n, t in BOOKS.items()) +
@@ -724,23 +778,39 @@ def main() -> int:
             log("today's 09:20 check already found no trade; nothing to do")
             return 0
         if not state.get("books"):
+            if state.get("confirmed") is False:
+                log("today's 10:15 confirmation already failed; nothing to do")
+                return 0
+            if "pick" not in state:
+                if datetime.now(IST).time() > PICK_LATEST:
+                    log(f"started after {PICK_LATEST:%H:%M} with no 09:20 pick on record; nothing to do today")
+                    return 0
+                sectors = load_sectors()
+                sleep_until(SNAPSHOT_TIME)
+                if _shutdown:
+                    return 0
+                choice = pick(client, sectors)
+                state["pick"] = choice
+                save_state(state)
+                if choice is None:
+                    return 0
+                log(f"PICK: {choice['side'].upper()} {choice['symbol']} ({choice['stock_pct']:+.2f}%) from "
+                    f"{choice['sector']} ({choice['sector_pct']:+.2f}%), NIFTY {choice['nifty_pct']:+.2f}%, "
+                    f"option expiry {choice['expiry']}; 09:20 prices {choice.get('ref_price')} / "
+                    f"NIFTY {choice.get('nifty_ref')}; waiting for the {CONFIRM_TIME:%H:%M} confirmation")
+            else:
+                choice = state["pick"]
+                log(f"resuming today's pick {choice['side']} {choice['symbol']}, waiting for {CONFIRM_TIME:%H:%M}")
             if datetime.now(IST).time() > LATEST_ENTRY:
                 log(f"started after {LATEST_ENTRY:%H:%M} with no trade on record; nothing to do today")
                 return 0
-            sectors = load_sectors()
-            sleep_until(SNAPSHOT_TIME)
+            sleep_until(CONFIRM_TIME)
             if _shutdown:
                 return 0
-            choice = pick(client, sectors)
-            state["pick"] = choice
+            entry = confirm(client, choice)
+            state["confirmed"] = entry is not None
             save_state(state)
-            if choice is None:
-                return 0
-            log(f"PICK: {choice['side'].upper()} {choice['symbol']} ({choice['stock_pct']:+.2f}%) from "
-                f"{choice['sector']} ({choice['sector_pct']:+.2f}%), NIFTY {choice['nifty_pct']:+.2f}%, "
-                f"option expiry {choice['expiry']}")
-            sleep_until(ENTRY_TIME)
-            if _shutdown or not open_books(client, state, choice):
+            if entry is None or not open_books(client, state, choice, entry):
                 return 0
         else:
             log(f"resuming {state['pick']['side']} {state['pick']['symbol']} from saved state")

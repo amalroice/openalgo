@@ -44,8 +44,9 @@ def load(path: Path, monkeypatch):
 class Broker:
     """Scripted client for quotes, option lookups and orders."""
 
-    def __init__(self, stock_prices=None, fno=("BRITANNIA", "WIPRO"), sell_status="complete"):
+    def __init__(self, stock_prices=None, fno=("BRITANNIA", "WIPRO"), sell_status="complete", nifty=100.0):
         self.stock_prices = list(stock_prices or [100.0])
+        self.nifty = nifty
         self.fno = set(fno)
         self.sell_status = sell_status
         self.orders: list[dict] = []
@@ -64,6 +65,8 @@ class Broker:
         if exchange == "NFO":
             self.option_quotes += 1
             return {"status": "success", "data": {"ltp": 50.0, "bid": 49.5, "ask": 50.5}}
+        if exchange == "NSE_INDEX":
+            return {"status": "success", "data": {"ltp": self.nifty}}
         price = self.stock_prices.pop(0) if len(self.stock_prices) > 1 else self.stock_prices[0]
         return {"status": "success", "data": {"ltp": price}}
 
@@ -214,3 +217,54 @@ def test_open_trade_closes_at_the_time_limit(path, monkeypatch):
         assert book["why"] == "square-off"
     sells = [o for o in broker.orders if o["action"] == "SELL"]
     assert len(sells) == 1 and sells[0]["quantity"] == 125
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_pick_records_the_0920_reference_prices(path, monkeypatch):
+    m = load(path, monkeypatch)
+    choice = m.pick(Broker(), SECTORS)
+    assert choice["ref_price"] == pytest.approx(102.4)
+    assert choice["nifty_ref"] == pytest.approx(100.5)
+
+
+CONFIRM_CASES = [
+    # side, stock at 10:15, NIFTY at 10:15, confirmed?  (09:20: stock 100, NIFTY 1000)
+    ("long", 100.6, 1001.0, True),
+    ("long", 100.3, 1001.0, False),   # stock only +0.3%
+    ("long", 100.6, 999.0, False),    # NIFTY turned down
+    ("short", 99.4, 999.0, True),
+    ("short", 99.4, 1000.5, False),   # NIFTY turned up
+    ("short", 100.6, 999.0, False),   # stock went the wrong way
+]
+
+
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize("side,stock,nifty,expected", CONFIRM_CASES)
+def test_entry_needs_the_1015_confirmation(path, side, stock, nifty, expected, monkeypatch):
+    m = load(path, monkeypatch)
+    broker = Broker(stock_prices=[stock], nifty=nifty)
+    choice = {"side": side, "symbol": "BRITANNIA", "ref_price": 100.0, "nifty_ref": 1000.0}
+    entry = m.confirm(broker, choice)
+    assert (entry == stock) if expected else (entry is None)
+    assert broker.orders == []
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_confirmed_entry_sets_levels_from_the_1015_price(path, monkeypatch):
+    m = load(path, monkeypatch)
+    monkeypatch.setattr(m, "TRADE_LIVE", True)
+    broker = Broker(stock_prices=[200.0])
+    state = {}
+    assert m.open_books(broker, state, {"side": "long", "symbol": "BRITANNIA", "expiry": "30DEC30"}, entry=150.0)
+    book = state["books"][m.LIVE_BOOK]
+    assert book["entry"] == 150.0 and book["stop"] == 148.5
+    assert len(broker.orders) == 1 and broker.orders[0]["action"] == "BUY"
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_entry_time_is_1015(path, monkeypatch):
+    if not path.exists():
+        pytest.skip(f"{path.name} is not on this machine")
+    text = path.read_text(encoding="utf-8")
+    assert "CONFIRM_TIME = dtime(10, 15)" in text and "CONFIRM_PCT = 0.5" in text
+    assert "TRADE_LIVE = True" in text
