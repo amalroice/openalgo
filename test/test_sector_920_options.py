@@ -191,12 +191,12 @@ def test_refused_live_sell_is_not_booked(path, monkeypatch):
 
 
 @pytest.mark.parametrize("path", PATHS)
-def test_time_limit_is_1010(path, monkeypatch):
+def test_square_off_is_1515(path, monkeypatch):
     if not path.exists():
         pytest.skip(f"{path.name} is not on this machine")
     # load() moves SQUARE_OFF out of the way for the other tests; read the file's own value
     text = path.read_text(encoding="utf-8")
-    assert "SQUARE_OFF = dtime(10, 10)" in text
+    assert "SQUARE_OFF = dtime(15, 15)" in text
 
 
 @pytest.mark.parametrize("path", PATHS)

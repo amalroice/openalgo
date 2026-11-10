@@ -28,9 +28,9 @@ Order of work each day (the user's, 2026-11-03):
        of 100 lies between entry and target, the target sits PSY_BUFFER_PCT
        (0.05%) short of it.
     6. Exit: the option lot is sold when the STOCK hits the target or the stop,
-       or at SQUARE_OFF (10:10, the user's 2026-11-03 time limit: a trade that
-       has not reached its target by 10:10 is closed there, win or lose; it
-       was 15:15 before). One trade a day.
+       or at SQUARE_OFF (15:15). From 2026-11-03 to 11-10 a 10:10 time limit
+       closed unfinished trades early; the user removed it on 2026-11-10 so a
+       trade is left to reach its target or stop. One trade a day.
 
 Two books run on the same pick, differing only in the target:
     1R     target 1.0%  (the rule as stated)
@@ -85,7 +85,7 @@ INDEX_SYMBOL, INDEX_EXCHANGE = "NIFTY", "NSE_INDEX"
 SNAPSHOT_TIME = dtime(9, 20)
 ENTRY_TIME = dtime(9, 21)
 LATEST_ENTRY = dtime(9, 25)         # a late start after this skips the day
-SQUARE_OFF = dtime(10, 10)         # time limit: unfinished trades close here (15:15 until 2026-11-03)
+SQUARE_OFF = dtime(15, 15)         # MIS square-off; was a 10:10 time limit 2026-11-03..11-10
 
 MAX_MOVE_PCT = 4.0
 STOP_PCT = 1.0
