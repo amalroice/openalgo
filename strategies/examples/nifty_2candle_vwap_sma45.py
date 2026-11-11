@@ -64,7 +64,7 @@ Stop:
     back toward the 51.8% this buffer was introduced to escape. Do not retry it.
 
 Management (2 lots, split - from 2026-11-02):
-    lock lot   once the trade has run BREAKEVEN_AT_PTS (25) points, its stop
+    lock lot   once the trade has run BREAKEVEN_AT_PTS (40, was 25 to 2026-11-11) points, its stop
                is never worse than entry + BREAKEVEN_LOCK_PTS (15).
     runner     RUNNER_LOTS (1) lot whose stop only goes to entry +
                RUNNER_LOCK_PTS (0) at the same point, so it can ride the
@@ -85,9 +85,12 @@ Management (2 lots, split - from 2026-11-02):
                trade has run LOCK_AT_R times its initial risk, the stop is
                never worse than LOCK_TO_R times that risk in profit.
     breakeven  ON from 2026-11-02: once the trade has run BREAKEVEN_AT_PTS
-               (25) index points, the stop is never worse than
+               (40 from 2026-11-12, was 25) index points, the stop is never worse than
                BREAKEVEN_LOCK_PTS (15) points in profit. Checked at the bar
                close like every stop here, so the exit can land below +15.
+    push       ON from 2026-11-12: a bar closing in profit with a body of
+               PUSH_BODY_PTS (30)+ in the trade's direction lifts both legs'
+               stops to that bar's low - PUSH_BUFFER_PTS (10) (short: high + 10).
     broker     the resting broker stop is a mechanical-failure backstop only.
     15:00      everything is squared off
 
@@ -384,8 +387,33 @@ LOCK_TO_R = 0.5                     # then the stop is at least this many R in p
 # loosest rules average 2.1 a day at PF ~1.0. Revert: ADR_MIN = 1.5,
 # BREAKEVEN_AT_PTS = None. Reproduce: session bb9420a2 scratchpad
 # nf_research.py / nf_sweep.py (stage1-3).
-BREAKEVEN_AT_PTS = 25.0             # was None (2026-10-01..30), 40.0 with no lock (2026-09-24..30)
+# 2026-11-11, user's request ("risk to reward is not proper"): the lock leg at
+# +25 -> +15 had RR 1.00 over the last 2y (avg win 33.5 = avg loss 33.5 pts,
+# 62% of its wins <= 20 pts). Trigger moved to +40 (lock still +15); the
+# runner's EMA exit arms at the same +40. Plus the user's candle push (see
+# PUSH_BODY_PTS). Replayed 2016-10..2026-11-09 on this script's rules (candle 2
+# <= 50), 2 lots, 3 pts/lot, option Rs = pts x 65 x 0.6, stop exits at close:
+#
+#                              10y              last 2y           last 1y
+#   +25 -> +15 (old)       151k PF 1.08     162k PF 1.48     116k PF 1.71   RR 1.42/1.50/1.51
+#   +40 -> +15             283k PF 1.14     242k PF 1.62     162k PF 1.88
+#   +40 -> +15 + push      305k PF 1.15     270k PF 1.71     181k PF 2.03   RR 1.64/1.67/1.61
+#
+# Win rate 41/51/56% (old 43/50/53). About 50 variants were tried that day, so
+# the pick is partly fitted; it beats the old rule in every window. Revert:
+# BREAKEVEN_AT_PTS = 25.0, PUSH_BODY_PTS = None. Reproduce: session a3a805f3
+# scratchpad nf_rr_var.py, nf_candle_sl.py, nf_combo_push.py.
+BREAKEVEN_AT_PTS = 40.0             # was 25.0 (2026-10-30..11-11), None (10-01..30), 40.0 no lock (09-24..30)
 BREAKEVEN_LOCK_PTS = 15.0           # the stop then sits this many points in profit
+
+# Candle push, user's rule 2026-11-11: while the trade is in profit on a bar's
+# close, a 5m candle whose body (close - open) runs PUSH_BODY_PTS or more in the
+# trade's direction lifts BOTH legs' stops to that candle's low - PUSH_BUFFER_PTS
+# (high + buffer for a short). Only ever tightens; checked against the next bar.
+# Applies to the EMA runner too (its stop is otherwise only the crash stop).
+# Without the 10 pt buffer, to the candle middle, or at 20 pts it was worse.
+PUSH_BODY_PTS = 30.0                # None disables the push
+PUSH_BUFFER_PTS = 10.0
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
@@ -2059,8 +2087,8 @@ def exit_legs(client, state: dict, names: list[str], spot: float,
 
 
 def advance_leg_stop(name: str, stop: float, position: dict, entry: float,
-                     long: bool) -> float:
-    """Trail, lock, breakeven and step rules for one leg; only ever tightens."""
+                     long: bool, bar=None) -> float:
+    """Trail, lock, breakeven, step and candle-push rules for one leg; only ever tightens."""
     tag = f"[{name}] "
 
     def tighten(level: float, what: str) -> None:
@@ -2089,6 +2117,14 @@ def advance_leg_stop(name: str, stop: float, position: dict, entry: float,
     if STEP_TRAIL_PTS is not None and stop0 is not None and position["mfe"] >= STEP_TRAIL_PTS:
         steps = int(position["mfe"] // STEP_TRAIL_PTS)
         tighten(float(stop0) + (1 if long else -1) * steps * STEP_TRAIL_MOVE_PTS, "step")
+    if PUSH_BODY_PTS is not None and bar is not None:
+        o, c = float(bar["open"]), float(bar["close"])
+        body = (c - o) if long else (o - c)
+        in_profit = (c > entry) if long else (c < entry)
+        if body >= PUSH_BODY_PTS and in_profit:
+            level = (float(bar["low"]) - PUSH_BUFFER_PTS) if long \
+                else (float(bar["high"]) + PUSH_BUFFER_PTS)
+            tighten(level, f"candle push ({body:.0f} pt body)")
     return stop
 
 
@@ -2199,7 +2235,7 @@ def manage(client, state: dict, frame: pd.DataFrame) -> dict:
     # the trade's favour, and is checked against the NEXT bar, as the backtest
     # does. The lock leg and the runner differ only at the breakeven step.
     for name, leg in legs.items():
-        leg["stop"] = advance_leg_stop(name, float(leg["stop"]), position, entry, long)
+        leg["stop"] = advance_leg_stop(name, float(leg["stop"]), position, entry, long, bar)
     sync_position(position)
 
     # The lock leg is locked once breakeven fires; from the next bar the runner
@@ -2480,7 +2516,8 @@ def main() -> int:
         f"advance-decline >= {ADR_MIN}x; "
         f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts "
         f"locks +{BREAKEVEN_LOCK_PTS} pts; {LOTS} lots, {RUNNER_LOTS} runner at "
-        f"entry {RUNNER_LOCK_PTS:+.0f}")
+        f"entry {RUNNER_LOCK_PTS:+.0f}; candle push: {PUSH_BODY_PTS} pt body in profit "
+        f"-> stop to its low/high -{PUSH_BUFFER_PTS}")
 
     if USE_WEBSOCKET_VOLUME:
         _FEED = VolumeFeed(build_client(), CONSTITUENTS)
