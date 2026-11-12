@@ -35,6 +35,9 @@ Entry (long; short is the mirror):
     7. Candle 2's high-low range is at most MAX_SIGNAL_BAR_PTS (50) index
        points. Added 2026-11-10; see MAX_SIGNAL_BAR_PTS.
 
+    8. Candles 1 and 2 are the same colour as the trade: both green for a
+       long, both red for a short (SAME_COLOR, from 2026-11-13).
+
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
     LINE_PROXIMITY points of that level, the line is used instead. The lines
@@ -517,6 +520,22 @@ VIX_MIN = 12.0
 # Reproduce: session a3a805f3 scratchpad nf_lossday.py / nf_step4.py.
 # None switches it off.
 MAX_SIGNAL_BAR_PTS = 50.0
+
+# Same-colour candles, user's rule 2026-11-12 (live from 11-13): candle 1 and
+# candle 2 must both be green (close > open) for a long, both red for a short.
+# Replay 2020-11-01..2026-11-12 on these live rules (2 lots, lock +40 -> +15,
+# EMA21 runner, candle push, VIX >= 12, candle 2 <= 50 pts), bar-close fills,
+# 3 pts a lot, Rs = pts x 65, Nov-to-Oct years:
+#
+#                   20-21   21-22    22-23   23-24   24-25   25-26   all     PF    maxDD
+#     off           +85k   -119k    -51k   +173k   +148k   +299k  +535k   1.26  -237k
+#     same colour   +73k   -104k    -37k   +219k   +196k   +311k  +658k   1.37  -205k
+#
+# It drops 132 of 887 trades (37% win, -137k together); better or level in 5
+# of 6 years. A single filter tested once, not tuned. 2026-11-12's losing
+# 10:35 long had a red candle 1 and would have been skipped.
+# Reproduce: backtesting/yearly_nov/color_filter.py. False switches it off.
+SAME_COLOR = True
 
 # Trend filter, added 2026-09-21 on the user's decision: take a long only when
 # SMA(45) on candle 2 is higher than it was SLOPE_BARS candles earlier, a short
@@ -1225,6 +1244,15 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
         # tested here, and the full-window drawdown more than halves.
         if not _pair_breaks_out(first, second, direction):
             continue
+        if SAME_COLOR:
+            both = all((float(b["close"]) > float(b["open"])) if direction == "long"
+                       else (float(b["close"]) < float(b["open"])) for b in (first, second))
+            if not both:
+                log(f"{direction} signal skipped: candles 1 and 2 are not both "
+                    f"{'green' if direction == 'long' else 'red'} "
+                    f"(c1 {float(first['open']):.2f} -> {float(first['close']):.2f}, "
+                    f"c2 {float(second['open']):.2f} -> {float(second['close']):.2f})")
+                continue
         if SLOPE_BARS:
             slope = float(second.get("sma_slope", float("nan")))
             # NaN fails both comparisons, so an unreadable slope skips.
