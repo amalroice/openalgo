@@ -63,11 +63,7 @@ Stop:
     inert and converges on doing nothing. Tightening pushes the stop-out rate
     back toward the 51.8% this buffer was introduced to escape. Do not retry it.
 
-Management from 2026-11-13: 1 lot, POINT_TRAIL - the stop moves forward as
-many index points as the trade's best price moves in its favour; stop or
-15:00 square-off are the only exits. The rules below are switched off.
-
-Management (2 lots, split - 2026-11-02..11-12):
+Management (2 lots, split - from 2026-11-02):
     lock lot   once the trade has run BREAKEVEN_AT_PTS (40, was 25 to 2026-11-11) points, its stop
                is never worse than entry + BREAKEVEN_LOCK_PTS (15).
     runner     RUNNER_LOTS (1) lot whose stop only goes to entry +
@@ -154,7 +150,7 @@ SMA_PERIOD = 45
 LOOKBACK_DAYS = 10                  # history span, must warm up SMA(45)
 
 ITM_POINTS = 100                    # strike this far in the money (CE below ATM, PE above); was ATM until 2026-09-29
-LOTS = 1                            # 1 until 2026-10-30; 2 2026-11-02..11-12 (lock/runner split); 1 from 2026-11-13 (user)
+LOTS = 2                            # 1 until 2026-10-30; 2 from 2026-11-02 for the lock/runner split
 # Two-lot split, user's request 2026-10-30: one lot locks profit, the other
 # only goes to breakeven and rides the trail. Replayed on the 2026-11-02 rules
 # (no breadth gate, lock at +25), 3 pts a lot, 2026-01..10-30:
@@ -162,7 +158,7 @@ LOTS = 1                            # 1 until 2026-10-30; 2 2026-11-02..11-12 (l
 #     lock + breakeven runner +1,967 pts  (Rs 1.28L)  PF 1.40, win 59%, maxDD -37k
 # Last 2y +3,912 pts PF 1.33; ten years +1,551 pts PF 1.03 (2017-19, 2022,
 # 2023 lose). Reproduce: session bb9420a2 scratchpad nf_twolot.py.
-RUNNER_LOTS = 0                     # of LOTS, these only go to breakeven; 0 locks every lot (1 until 2026-11-12)
+RUNNER_LOTS = 1                     # of LOTS, these only go to breakeven; 0 locks every lot
 RUNNER_LOCK_PTS = 0.0               # the runner's floor once BREAKEVEN_AT_PTS is reached
 # Runner EMA exit, user's request 2026-11-06: once the breakeven lock has fired
 # (the lock leg is locked at +BREAKEVEN_LOCK_PTS), the runner stops riding the
@@ -407,7 +403,7 @@ LOCK_TO_R = 0.5                     # then the stop is at least this many R in p
 # the pick is partly fitted; it beats the old rule in every window. Revert:
 # BREAKEVEN_AT_PTS = 25.0, PUSH_BODY_PTS = None. Reproduce: session a3a805f3
 # scratchpad nf_rr_var.py, nf_candle_sl.py, nf_combo_push.py.
-BREAKEVEN_AT_PTS = None             # off from 2026-11-13 (POINT_TRAIL replaces it); was 40.0 (11-12), 25.0 (2026-10-30..11-11), None (10-01..30), 40.0 no lock (09-24..30)
+BREAKEVEN_AT_PTS = 40.0             # was 25.0 (2026-10-30..11-11), None (10-01..30), 40.0 no lock (09-24..30)
 BREAKEVEN_LOCK_PTS = 15.0           # the stop then sits this many points in profit
 
 # Candle push, user's rule 2026-11-11: while the trade is in profit on a bar's
@@ -416,19 +412,8 @@ BREAKEVEN_LOCK_PTS = 15.0           # the stop then sits this many points in pro
 # (high + buffer for a short). Only ever tightens; checked against the next bar.
 # Applies to the EMA runner too (its stop is otherwise only the crash stop).
 # Without the 10 pt buffer, to the candle middle, or at 20 pts it was worse.
-PUSH_BODY_PTS = None                # None disables the push; off from 2026-11-13 (POINT_TRAIL), was 30.0
+PUSH_BODY_PTS = 30.0                # None disables the push
 PUSH_BUFFER_PTS = 10.0
-
-# Point-for-point trailing stop, user's rule 2026-11-12 (live from 11-13):
-# every index point the trade moves in its favour moves the stop the same
-# number of points forward, so the stop always sits the initial risk behind
-# the best price: stop = stop0 + best excursion (short: stop0 - excursion).
-# It replaces the % trail, breakeven lock, candle push and EMA runner (all
-# skipped while this is on). Best excursion is each closed bar's high (short:
-# low); the moved stop is checked against the NEXT bar, like every stop here.
-# The only other exits are the stop itself and the 15:00 square-off.
-# NOT backtested before going live (user's call).
-POINT_TRAIL = True
 
 MAX_TRADES_PER_DAY = 2
 DIRECTIONS = ("long", "short")      # sides to trade
@@ -2113,12 +2098,6 @@ def advance_leg_stop(name: str, stop: float, position: dict, entry: float,
             log(f"{tag}{what}: best +{position['mfe']:.2f} pts, stop {stop:.2f} -> {moved:.2f}")
             stop = moved
 
-    if POINT_TRAIL:
-        stop0 = float(position.get("stop0") if position.get("stop0") is not None else stop)
-        mfe = max(0.0, float(position["mfe"]))
-        tighten(stop0 + mfe if long else stop0 - mfe, "point trail")
-        return stop
-
     # With the EMA exit on, the runner neither trails nor moves to breakeven:
     # the EMA close is its exit and its entry stop stays only as the crash stop.
     ema_owns_runner = name == "runner" and RUNNER_EMA_PERIOD
@@ -2531,12 +2510,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     client = build_client()
-    if POINT_TRAIL:
-        log(f"{STRATEGY_TAG} starting: {LOTS} lot(s), stop moves point for point with the best "
-            f"index price (stays the initial risk behind it), square-off {SQUARE_OFF:%H:%M}")
-    else:
-        log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
-            f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
+    log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
+        f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
     log(f"filters: VIX >= {VIX_MIN}, candle 2 <= {MAX_SIGNAL_BAR_PTS} pts, SMA slope over {SLOPE_BARS} bars, "
         f"advance-decline >= {ADR_MIN}x; "
         f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts "
