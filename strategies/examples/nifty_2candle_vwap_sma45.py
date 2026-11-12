@@ -26,7 +26,8 @@ Entry (long; short is the mirror):
        SLOPE_BARS candles: higher than it was for a long, lower for a short.
        Added 2026-09-21 over 6 bars, switched off 2026-09-22, back on that
        night over 2 bars, then off again (SLOPE_BARS = None) in favour of
-       the breadth gate alone. See the tables at SLOPE_BARS.
+       the breadth gate alone. ON again over 6 bars from 2026-11-13. See the
+       tables at SLOPE_BARS.
     6. NIFTY 50 breadth leans with the trade: advancers at least ADR_MIN
        times decliners for a long, the reverse for a short, read from
        multiquotes when the signal fires. Added 2026-09-22 at 1.5x; OFF from
@@ -37,6 +38,10 @@ Entry (long; short is the mirror):
 
     8. Candles 1 and 2 are the same colour as the trade: both green for a
        long, both red for a short (SAME_COLOR, from 2026-11-13).
+
+    9. Candle 2 closes at least MIN_CLOSE_PAST_LINE (20) points beyond the
+       line: above the higher of VWAP/SMA for a long, below the lower for a
+       short (from 2026-11-13).
 
 Stop:
     Candle 1's low, less STOP_BUFFER points. If the higher line sits within
@@ -593,7 +598,22 @@ SAME_COLOR = True
 # 09-15 short, which any slope length blocks. Last 2y ADR alone: +2.28L PF 2.09
 # Sh 2.26 DD -27k. Reproduce: session febea895 scratchpad
 # nifty_month_adr_alone.py. Set 2 to restore.
-SLOPE_BARS = None
+#
+# ON AGAIN over 6 bars from 2026-11-13, on the user's decision, together with
+# MIN_CLOSE_PAST_LINE = 20 (aim: win rate). Replay on the live 2-lot rules
+# (lock +40 -> +15, EMA21 runner, push, VIX >= 12, c2 <= 50, SAME_COLOR),
+# bar-close fills, 3 pts a lot, Rs = pts x 65:
+#
+#                          last 2y (2024-11..2026-11-12)             2020-11..2026-11-12
+#                          trades/wk  win%   PF    net     maxDD     win%   PF    net     maxDD
+#     neither               2.21     53.0  1.99  +5.08L   -48k     44.6  1.38  +6.70L  -2.05L
+#     slope 6 only          1.56     57.6  2.63  +5.10L   -36k     49.8  1.72  +7.58L  -0.99L
+#     slope 6 + past 20     1.40     60.1  2.72  +4.91L   -32k     54.8  1.95  +8.01L  -0.82L
+#
+# The user accepted about 1.4 trades a week for the higher win rate. Chosen
+# from about 40 variants, so expect live to come in somewhat below. Reproduce:
+# backtesting/yearly_nov/winrate_grid.py (S0, S0D20). None disables it.
+SLOPE_BARS = 6
 
 # Breadth gate, added 2026-09-22 on the user's decision, first on top of the
 # slope and, from later that night, on its own (SLOPE_BARS = None):
@@ -613,6 +633,11 @@ SLOPE_BARS = None
 # session febea895 scratchpad nifty_slope_adr.py, nifty_month_trades.py.
 ADR_MIN = None                      # was 1.5 (2026-09-22..10-30); off for 3+ trading days a week
 ADR_MIN_STOCKS = 40                 # skip the signal if fewer quotes are readable
+
+# Candle 2 must close at least this many points beyond the line (the higher of
+# VWAP/SMA for a long, the lower for a short), on candle 2's own values. Added
+# 2026-11-13 with SLOPE_BARS = 6; see the table there. None disables it.
+MIN_CLOSE_PAST_LINE = 20.0
 
 MIN_CLEARANCE = 0.0                 # points a candle must clear both lines by
 STOP_BUFFER = 10.0                  # stop sits this far beyond candle 1
@@ -1259,6 +1284,13 @@ def latest_signal(frame: pd.DataFrame) -> dict | None:
             if not (slope > 0 if direction == "long" else slope < 0):
                 log(f"{direction} signal skipped: SMA({SMA_PERIOD}) moved "
                     f"{slope:+.2f} over {SLOPE_BARS} bars, against the trade")
+                continue
+        if MIN_CLOSE_PAST_LINE is not None:
+            line2 = float(second["upper"] if direction == "long" else second["lower"])
+            past = (float(second["close"]) - line2) if direction == "long" else (line2 - float(second["close"]))
+            if not past >= MIN_CLOSE_PAST_LINE:
+                log(f"{direction} signal skipped: candle 2 closed {past:.2f} pts beyond the line "
+                    f"({line2:.2f}), under {MIN_CLOSE_PAST_LINE:.0f}")
                 continue
         return {
             "direction": direction,
@@ -2540,7 +2572,7 @@ def main() -> int:
     client = build_client()
     log(f"{STRATEGY_TAG} starting: {LOTS} lots, stop trails {TRAIL_DIST_PCT:.1%} behind "
         f"the best price in {TRAIL_STEP_PCT:.1%} steps, square-off {SQUARE_OFF:%H:%M}")
-    log(f"filters: VIX >= {VIX_MIN}, candle 2 <= {MAX_SIGNAL_BAR_PTS} pts, SMA slope over {SLOPE_BARS} bars, "
+    log(f"filters: VIX >= {VIX_MIN}, candle 2 <= {MAX_SIGNAL_BAR_PTS} pts, SMA slope over {SLOPE_BARS} bars, close past line >= {MIN_CLOSE_PAST_LINE}, "
         f"advance-decline >= {ADR_MIN}x; "
         f"lock +{LOCK_TO_R}R once +{LOCK_AT_R}R; breakeven at +{BREAKEVEN_AT_PTS} pts "
         f"locks +{BREAKEVEN_LOCK_PTS} pts; {LOTS} lots, {RUNNER_LOTS} runner at "
