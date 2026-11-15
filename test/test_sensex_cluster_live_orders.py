@@ -565,7 +565,7 @@ def test_c_rule_set_constants():
     assert scb.MIN_CLOSE_LOCATION is None
     assert scb.MIN_BAR_ATR == pytest.approx(0.743) and scb.MIN_DAY_POSITION == pytest.approx(0.504)
     assert scb.NO_NEW_ENTRY_AFTER.strftime("%H:%M") == "14:30"
-    assert scb.TRADE_LIVE is False
+    assert scb.TRADE_LIVE is True
 
 
 def test_two_lot_plain_runner_constants():
