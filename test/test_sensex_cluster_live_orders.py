@@ -541,7 +541,26 @@ def test_refused_leg_sale_is_retried_and_the_backstop_put_back():
 def test_close_location_measures_toward_the_breakout_side():
     bar = {"high": 75444.12, "low": 75377.25, "close": 75399.73}   # 2026-11-02 09:40, the fake long
     assert scb.close_location(bar, True) == pytest.approx(0.336, abs=1e-3)
-    assert scb.close_location(bar, True) < scb.MIN_CLOSE_LOCATION
+    assert scb.close_location(bar, True) < 0.6   # the 0.6 gate it was built for (off from 2026-11-15)
     assert scb.close_location(bar, False) == pytest.approx(0.664, abs=1e-3)
     assert scb.close_location({"high": 100.0, "low": 90.0, "close": 99.0}, True) == pytest.approx(0.9)
     assert scb.close_location({"high": 100.0, "low": 100.0, "close": 100.0}, False) == 1.0
+
+
+def test_day_position_measures_toward_the_trade_side():
+    idx = pd.date_range("2026-11-16 09:15", periods=3, freq="5min", tz="Asia/Kolkata")
+    frame = pd.DataFrame({"open": [100.0, 104.0, 108.0], "high": [105.0, 110.0, 109.0],
+                          "low": [90.0, 103.0, 106.0], "close": [104.0, 108.0, 107.0]}, index=idx)
+    assert scb.day_position(frame, True) == pytest.approx(17 / 20)
+    assert scb.day_position(frame, False) == pytest.approx(3 / 20)
+    flat = frame.assign(high=100.0, low=100.0, close=100.0)
+    assert scb.day_position(flat, True) is None
+
+
+def test_c_rule_set_constants():
+    assert scb.LOCK_AT_ATR == 1.5 and scb.LOCK_ATR == 0.5
+    assert scb.BOOK_BOX_ATR_MAX["boxatr"] == 3.0
+    assert scb.MIN_CLOSE_LOCATION is None
+    assert scb.MIN_BAR_ATR == pytest.approx(0.743) and scb.MIN_DAY_POSITION == pytest.approx(0.504)
+    assert scb.NO_NEW_ENTRY_AFTER.strftime("%H:%M") == "14:30"
+    assert scb.TRADE_LIVE is False

@@ -185,8 +185,12 @@ BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points a
 # Revert: LOCK_AT_ATR = RUNNER_LOCK_AT_ATR = None, GAP_LOT_MULTIPLIER = 1,
 # NO_NEW_ENTRY_AFTER 14:30. Reproduce: session e5b5848a scratchpad sxw.py /
 # sxw2.py / sizing.py / tenyr.py.
-LOCK_AT_ATR = 2.0                   # best move, in entry ATRs, that arms the lock lot's floor
-LOCK_ATR = 1.0                      # the lock lot's floor, entry ATRs in profit
+# 2026-11-15 (user: win near 60%, PF > 1.5, >= 2 trades a week): the lock
+# arms earlier, at +1.5 ATR, and floors the stop at entry + 0.5 ATR (was
+# +2 -> +1). Part of the "C" rule set with MIN_BAR_ATR / MIN_DAY_POSITION
+# below; results there. Revert: 2.0 and 1.0.
+LOCK_AT_ATR = 1.5                   # best move, in entry ATRs, that arms the lock lot's floor
+LOCK_ATR = 0.5                      # the lock lot's floor, entry ATRs in profit
 RUNNER_LOTS = 0                     # of LIVE_LOTS, these use the runner's lock; 0 from 2026-11-02 (1 lot, lock lot rules)
 RUNNER_LOCK_AT_ATR = 4.0            # best move, in entry ATRs, that arms the runner's floor
 RUNNER_LOCK_ATR = 1.0               # the runner's floor, entry ATRs in profit
@@ -226,7 +230,8 @@ BOOK_VIX_MIN = {"boxatr": VIX_MIN}
 # 2016-22 PF 1.16 -> 1.31; 2023-26 PF 1.41 -> 1.36 (win 53%); Oct 2026 PF
 # 1.60 -> 1.91. Box 1.5 / 2.5 worse; 12:00 / 13:00 alike. Revert: 3.0 and
 # 13:30. Reproduce: session acdcf260 scratchpad sx_sweep1.py / sx_check.py.
-BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
+# 2026-11-15: back to 3 ATR for the "C" rule set (see MIN_BAR_ATR).
+BOOK_BOX_ATR_MAX = {"boxatr": 3.0}
 # Breakout-bar confirmation, 2026-11-02 (user: avoid fake breakouts like
 # that day's 09:40 long, which closed 0.34 of the way up its bar under a long
 # upper wick). A long needs the breakout bar to close in the top 40% of its
@@ -235,7 +240,30 @@ BOOK_BOX_ATR_MAX = {"boxatr": 2.0}
 # 2y PF 1.33 -> 1.35, last 1y 1.55 -> 1.65; every value 0.4-0.7 behaves
 # alike, 0.8 is worse. Next-bar confirmation, breakout distance, bar body,
 # gap and trend-side gates all cost more than they saved. None switches it off.
-MIN_CLOSE_LOCATION = 0.6
+# 2026-11-15: off for the "C" rule set (was 0.6); the bar-size and
+# day-position gates below replace it.
+MIN_CLOSE_LOCATION = None
+# "C" rule set, 2026-11-15 (user: win near 60%, PF > 1.5, >= 2 trades a
+# week, any indicator allowed). About 17,000 indicator and exit combinations
+# were searched (RSI, Stochastic, Bollinger, Supertrend, ADX/DI, MACD, CCI,
+# EMA 9-200, daily trend, gap, time); none reached all three over ten years.
+# The closest, replayed exactly 2016-10..2026-10-30, 1 lot, 10 pts cost:
+#   breakout bar range >= MIN_BAR_ATR x ATR(14), and the bar's close in the
+#   trade-side part of today's range so far (long: (close - day low) /
+#   (day high - day low) >= MIN_DAY_POSITION; short: mirrored), with box cap
+#   3 ATR, entries to 14:30, no close-location gate, lock +1.5 -> +0.5 ATR.
+#                    trades/wk  win%   PF   (old rules: trades/wk, win%, PF)
+#   2016-22             3.67   59.4  1.15   (2.18, 52.0, 1.31)
+#   2023-26             2.46   60.0  1.47   (1.72, 52.8, 1.38)
+#   last 2y             2.68   60.6  1.47   (1.97, 54.1, 1.35)
+#   2022-23             3.29   61.4  1.40   (2.09, 52.5, 1.44)
+# Ten-year net about the same (Rs 4.67L vs 4.71L a lot). Thresholds are the
+# in-sample quantiles the search used; the lock was chosen after seeing
+# 2023-26, so those numbers flatter it. Paper trade only until proven.
+# None switches each gate off. Reproduce: session c331c847 scratchpad
+# sx60/verify.py (research.py, search.py).
+MIN_BAR_ATR = 0.743
+MIN_DAY_POSITION = 0.504
 ATR_PERIOD = 14
 ATR_WARMUP_DAYS = 10                # calendar days of prior bars for the ATR
 BREADTH_MIN_STOCKS = 40             # skip the signal if fewer quotes are readable
@@ -244,7 +272,7 @@ ITM_POINTS = 100                    # strike this far in the money; was ATM unti
 
 SESSION_OPEN = dtime(9, 15)
 NO_NEW_ENTRY_BEFORE = dtime(9, 30)
-NO_NEW_ENTRY_AFTER = dtime(12, 30)  # 13:30 2026-10-31..11-02, 14:30 before
+NO_NEW_ENTRY_AFTER = dtime(14, 30)  # 14:30 from 2026-11-15 ("C"); 12:30 11-02..11-15, 13:30 10-31..11-02
 SQUARE_OFF = dtime(15, 0)
 
 BAR_SECONDS = 300
@@ -547,6 +575,23 @@ def close_location(bar, long: bool) -> float:
     if rng <= 0:
         return 1.0
     return (close - low) / rng if long else (high - close) / rng
+
+
+def day_position(frame: pd.DataFrame, long: bool) -> float | None:
+    """Where the last bar closed in today's range so far, toward the trade side.
+
+    Args:
+        frame: today's completed bars, the breakout bar last.
+        long: True measures from the day's low, False from its high.
+
+    Returns:
+        0 (at the far end) to 1 (at the trade-side extreme), None if the range is zero.
+    """
+    high, low = float(frame["high"].max()), float(frame["low"].min())
+    close = float(frame["close"].iloc[-1])
+    if not high > low:
+        return None
+    return (close - low) / (high - low) if long else (high - close) / (high - low)
 
 
 def scan(frame: pd.DataFrame, start: int) -> tuple[dict | None, dict | None]:
@@ -1515,6 +1560,19 @@ def cycle(client, state: dict) -> dict:
                 log(f"[{name}] {side} breakout skipped: box {box:.2f} pts is {box_atr_text(box, atr, cap)}")
                 continue
             log(f"[{name}] box {box:.2f} pts is {box_atr_text(box, atr, cap)}")
+        if MIN_BAR_ATR is not None:
+            bar_rng = float(frame["high"].iloc[-1] - frame["low"].iloc[-1])
+            if bar_rng < MIN_BAR_ATR * atr:
+                log(f"[{name}] {side} breakout skipped: bar range {bar_rng:.2f} pts is "
+                    f"{bar_rng / atr:.2f}x ATR, needs {MIN_BAR_ATR:g}x")
+                continue
+        if MIN_DAY_POSITION is not None:
+            dpos = day_position(frame, side == "long")
+            if dpos is None or dpos < MIN_DAY_POSITION:
+                shown_pos = "unreadable" if dpos is None else f"{dpos:.2f}"
+                log(f"[{name}] {side} breakout skipped: close sits {shown_pos} of the way to the day's "
+                    f"{'high' if side == 'long' else 'low'}, needs {MIN_DAY_POSITION:g}")
+                continue
 
         long = side == "long"
         if "spot" not in legs:
@@ -1621,7 +1679,10 @@ def main() -> int:
     breadth_rule = (f" and NIFTY 50 breadth one-sided >= {BREADTH_MIN:g}x"
                     if BREADTH_MIN is not None else ", breadth filter off")
     log(f"book: boxatr (VIX > {VIX_MIN:g}{breadth_rule}, box <= "
-        f"{BOOK_BOX_ATR_MAX['boxatr']:g}x ATR{ATR_PERIOD}); "
+        f"{BOOK_BOX_ATR_MAX['boxatr']:g}x ATR{ATR_PERIOD}"
+        f"{f', bar >= {MIN_BAR_ATR:g}x ATR' if MIN_BAR_ATR is not None else ''}"
+        f"{f', close >= {MIN_DAY_POSITION:g} of the day range' if MIN_DAY_POSITION is not None else ''}"
+        f"{f', close location >= {MIN_CLOSE_LOCATION:g}' if MIN_CLOSE_LOCATION is not None else ''}); "
         f"option {ITM_POINTS} pts ITM; locks: lock lot +{LOCK_ATR} ATR once +{LOCK_AT_ATR} ATR, "
         f"runner +{RUNNER_LOCK_ATR} ATR once +{RUNNER_LOCK_AT_ATR} ATR")
 
