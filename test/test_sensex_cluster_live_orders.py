@@ -416,7 +416,9 @@ def test_live_entry_buys_the_lots_it_is_given():
     assert placed(client, "SELL", "SL-M")[0]["quantity"] == LEG["lotsize"] * 4
 
 
-def test_atr_locks_arm_per_leg_and_the_position_stop_is_the_loosest():
+def test_atr_locks_arm_per_leg_and_the_position_stop_is_the_loosest(monkeypatch):
+    monkeypatch.setattr(scb, "RUNNER_LOCK_AT_ATR", 4.0)
+    monkeypatch.setattr(scb, "RUNNER_LOCK_ATR", 1.0)
     book = split_book()
     pos = book["position"]
     atr = 50.0
@@ -564,3 +566,25 @@ def test_c_rule_set_constants():
     assert scb.MIN_BAR_ATR == pytest.approx(0.743) and scb.MIN_DAY_POSITION == pytest.approx(0.504)
     assert scb.NO_NEW_ENTRY_AFTER.strftime("%H:%M") == "14:30"
     assert scb.TRADE_LIVE is False
+
+
+def test_two_lot_plain_runner_constants():
+    assert scb.LIVE_LOTS == 2 and scb.RUNNER_LOTS == 1
+    assert scb.RUNNER_LOCK_AT_ATR is None
+    legs = scb.initial_legs(75000.0)
+    assert legs["lock"]["lots"] == 1 and legs["runner"]["lots"] == 1
+
+
+def test_runner_without_lock_only_trails():
+    book = split_book()
+    pos = book["position"]
+    atr = 50.0
+    pos["atr"] = atr
+    entry = pos["entry"]
+    runner0 = pos["legs"]["runner"]["stop"]
+    pos["mfe"] = 10 * atr  # far past any lock arm
+    scb.advance_legs("boxatr", pos)
+    assert pos["legs"]["lock"]["stop"] >= entry + scb.LOCK_ATR * atr
+    trail = scb.trail_level(entry, pos["mfe"], pos["direction"] == "long")
+    expected = runner0 if trail is None else (max(runner0, trail) if pos["direction"] == "long" else min(runner0, trail))
+    assert pos["legs"]["runner"]["stop"] == pytest.approx(expected)

@@ -189,11 +189,19 @@ BREAKEVEN_AT_PTS = None             # was 120 on 2026-09-29 only; costs points a
 # arms earlier, at +1.5 ATR, and floors the stop at entry + 0.5 ATR (was
 # +2 -> +1). Part of the "C" rule set with MIN_BAR_ATR / MIN_DAY_POSITION
 # below; results there. Revert: 2.0 and 1.0.
+# 2026-11-15 (user, after 9-13 Nov lost Rs -3,069 on 4 small lock wins and
+# one full stop): 2 lots, the lock lot above plus a runner with NO lock that
+# rides the plain trail. Replayed 2016-10..2026-11-13, per lot, 10 pts a lot:
+#                      PF 10y  2016-22  2023-26  last 2y  last 1y  win% 2y
+#   C, 1 lock lot       1.27    1.15     1.45     1.44     1.56     60
+#   C + plain runner    1.32    1.22     1.48     1.53     1.82     49
+# 9-13 Nov: +56 pts (2 lots) vs -153. Win rate gives up the 60% target.
+# Revert: LIVE_LOTS = 1, RUNNER_LOTS = 0.
 LOCK_AT_ATR = 1.5                   # best move, in entry ATRs, that arms the lock lot's floor
 LOCK_ATR = 0.5                      # the lock lot's floor, entry ATRs in profit
-RUNNER_LOTS = 0                     # of LIVE_LOTS, these use the runner's lock; 0 from 2026-11-02 (1 lot, lock lot rules)
-RUNNER_LOCK_AT_ATR = 4.0            # best move, in entry ATRs, that arms the runner's floor
-RUNNER_LOCK_ATR = 1.0               # the runner's floor, entry ATRs in profit
+RUNNER_LOTS = 1                     # of LIVE_LOTS, these use the runner's lock; 1 from 2026-11-16 (lock + plain runner)
+RUNNER_LOCK_AT_ATR = None           # None: the runner has no lock, trail only (was 4.0)
+RUNNER_LOCK_ATR = 1.0               # the runner's floor, entry ATRs in profit (unused while the arm is None)
 GAP_SIZE_PCT = 0.004                # |open / previous close - 1| at or above this is a gap day
 GAP_LOT_MULTIPLIER = 1              # lots multiplied by this on a gap day; 1 switches sizing off (off from 2026-11-02, user)
 COST_PTS = 10.0                     # assumed round-trip cost in the backtest
@@ -202,7 +210,7 @@ COST_PTS = 10.0                     # assumed round-trip cost in the backtest
 # follow the platform's Analyze (sandbox) versus Live mode, so this same code
 # can be dry run on the sandbox before real money is at risk.
 TRADE_LIVE = False                  # dry run from 2026-11-02 (user, 2026-10-31); True sends real orders
-LIVE_LOTS = 1                       # 1 lot from 2026-11-02 (user); was 2 (lock + runner) from 2026-10-30
+LIVE_LOTS = 2                       # 2 (lock + plain runner) from 2026-11-16 (user); 1 lot 2026-11-02..11-13
 LIVE_PRODUCT = "MIS"                # intraday; broker end-of-day square-off is the backstop
 ORDER_POLL_TRIES = 10               # 1s reads a market order is given to fill
 ORDER_POLL_SECONDS = 1
@@ -1683,8 +1691,10 @@ def main() -> int:
         f"{f', bar >= {MIN_BAR_ATR:g}x ATR' if MIN_BAR_ATR is not None else ''}"
         f"{f', close >= {MIN_DAY_POSITION:g} of the day range' if MIN_DAY_POSITION is not None else ''}"
         f"{f', close location >= {MIN_CLOSE_LOCATION:g}' if MIN_CLOSE_LOCATION is not None else ''}); "
-        f"option {ITM_POINTS} pts ITM; locks: lock lot +{LOCK_ATR} ATR once +{LOCK_AT_ATR} ATR, "
-        f"runner +{RUNNER_LOCK_ATR} ATR once +{RUNNER_LOCK_AT_ATR} ATR")
+        f"option {ITM_POINTS} pts ITM; {LIVE_LOTS} lots ({RUNNER_LOTS} runner); "
+        f"locks: lock lot +{LOCK_ATR} ATR once +{LOCK_AT_ATR} ATR, "
+        + (f"runner +{RUNNER_LOCK_ATR} ATR once +{RUNNER_LOCK_AT_ATR} ATR"
+           if RUNNER_LOCK_AT_ATR is not None else "runner trail only, no lock"))
 
     state = load_state()
     try:
