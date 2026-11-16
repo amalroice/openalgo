@@ -54,7 +54,15 @@ STRATS = {
         HERE / "bnf_live.pkl",
     ),
     "sector_920_momentum_20260930231437": ("Sector 920", None),
+    # sx_live.pkl: the live 2-lot rules (box <= 3 ATR, bar >= 0.743 ATR, day position
+    # >= 0.504, VIX > 13, NIFTY 50 breadth 2x, lock lot 1.5 -> +0.5 ATR, plain trail
+    # runner) replayed 2016-10-05..2026-10-30, 1,500 trades, 10 pts cost a lot; net is
+    # index points over both lots, R = net / (risk x 2). Built 2026-11-16 from the
+    # session c331c847 sx60 engine (see memory sensex-win60-pf15-search-2026-11-15).
+    "sensex_cluster_breakout_20260927180000": ("SENSEX cluster", HERE / "sx_live.pkl"),
 }
+SENSEX = "SENSEX cluster"
+SX_COST = 10.0  # backtest cost, index points a lot
 # index file, lot size, backtest cost in points a lot, engine name
 INDEX_META = {
     "NIFTY 2-candle": ("NIFTY_NSE_INDEX", 65, 3.0, "nifty"),
@@ -76,6 +84,19 @@ PARTIAL = re.compile(
 STOPFILL = re.compile(r"^\[(\S+ \S+) IST\] resting stop \S+ filled on (\S+);")
 RESTING = re.compile(r"broker stop resting: \d+ (\S+) trigger ([\d.]+)")
 EST = re.compile(r"option (?:\S+ )?([\d.]+) -> ([\d.]+)")
+# SENSEX logs its own fills inside the signal / entry / exit lines
+SX_SIG = re.compile(
+    r"^\[(\S+ \S+) IST\] \[\w+\] LIVE signal (LONG|SHORT): .*?; entry ([\d.]+), stop ([\d.]+) "
+    r"\(risk ([\d.]+) pts\); (\S+) premium [^;\s]+(?:; (\d+) lots)?"
+)
+SX_FILL = re.compile(r"^\[(\S+ \S+) IST\] LIVE entry \S+: filled ([\d.]+) x(\d+)")
+SX_LEG_EXIT = re.compile(
+    r"^\[(\S+ \S+) IST\] \[\w+\] LIVE EXIT (\S+) ([\w-]+) \((\d+) lot\): (?:long|short) [\d.]+ -> ([\d.]+)"
+)
+SX_EXIT = re.compile(
+    r"^\[(\S+ \S+) IST\] \[\w+\] LIVE EXIT ([\w-]+): (?:long|short) [\d.]+ -> ([\d.]+)"
+)
+SX_OPT = re.compile(r"; option [\d.]+ -> ([\d.]+)")
 
 
 def _left(p: dict) -> int:
@@ -189,6 +210,90 @@ def parse(prefix: str) -> list[dict]:
                 )
                 trades.append(p)
     return trades
+
+
+def parse_sensex(prefix: str) -> list[dict]:
+    """SENSEX option positions flat to flat, from its signal / "LIVE entry" / "LIVE EXIT" lines.
+
+    The lock and runner lots may exit separately ("LIVE EXIT lock stop (1 lot)"); the last
+    exit ("LIVE EXIT stop:") closes what is left. Each exit carries the option fill and the
+    index price, so p["idx_exits"] holds (lots, index price) for an exact live R. An exit
+    noticed after a hand sale only has the option LTP: it is priced as an estimate.
+    """
+    files = sorted(
+        f for f in LOGS.glob(f"{prefix}_*_IST.log") if f.name[len(prefix) + 1 :][:8] >= START
+    )
+    trades, pos, sig = [], None, None
+    for f in files:
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = SX_SIG.match(ln)
+            if m:
+                sig = {
+                    "dir": m.group(2).lower(),
+                    "idx_entry": float(m.group(3)),
+                    "idx_stop": float(m.group(4)),
+                    "risk_pts": float(m.group(5)),
+                    "symbol": m.group(6),
+                    "lots": int(m.group(7) or 1),
+                }
+                continue
+            m = SX_FILL.match(ln)
+            if m and sig is not None:
+                qty = int(m.group(3))
+                pos = dict(
+                    sig,
+                    entry_time=m.group(1),
+                    qty=qty,
+                    cost=qty * float(m.group(2)),
+                    sold=0,
+                    proceeds=0.0,
+                    unpriced=[],
+                    exits=[],
+                    idx_exits=[],
+                    lotsize=qty // max(sig["lots"], 1),
+                )
+                sig = None
+                continue
+            if pos is None:
+                continue
+            m = SX_LEG_EXIT.match(ln)
+            full = None if m else SX_EXIT.match(ln)
+            if not (m or full):
+                continue
+            if m:
+                ts, lots, idx = m.group(1), int(m.group(4)), float(m.group(5))
+                qty = lots * pos["lotsize"]
+            else:
+                ts, idx = full.group(1), float(full.group(3))
+                qty = pos["qty"] - pos["sold"] - sum(u["qty"] for u in pos["unpriced"])
+                lots = qty // max(pos["lotsize"], 1)
+            opt = SX_OPT.search(ln)
+            pos["exits"].append((ts, qty))
+            pos["idx_exits"].append((lots, idx))
+            pos["exit_time"] = ts
+            if "closed outside the strategy" in ln:
+                pos["unpriced"].append(
+                    {"qty": qty, "est": float(opt.group(1)) if opt else np.nan, "kind": "manual"}
+                )
+            elif opt:
+                pos["sold"] += qty
+                pos["proceeds"] += qty * float(opt.group(1))
+            else:
+                pos["unpriced"].append({"qty": qty, "est": np.nan, "kind": "unpriced"})
+            if full:
+                trades.append(pos)
+                pos = None
+    return trades
+
+
+def sensex_r(p: dict) -> float:
+    """Index R of a live SENSEX trade from its logged index exits, net of 10 pts a lot."""
+    if not p.get("idx_exits") or p["risk_pts"] <= 0:
+        return np.nan
+    sgn = 1.0 if p["dir"] == "long" else -1.0
+    lots = sum(n for n, _ in p["idx_exits"])
+    pts = sum(n * (sgn * (px - p["idx_entry"]) - SX_COST) for n, px in p["idx_exits"])
+    return pts / (p["risk_pts"] * lots) if lots else np.nan
 
 
 def band(pkl: Path, n: int, sims: int = 10000) -> dict:
@@ -393,7 +498,7 @@ def main():
     ov = {(r.symbol, str(r.entry_time)): float(r.exit_price) for r in ov.itertuples()}
     rows, parsed = [], {}
     for prefix, (name, _pkl) in STRATS.items():
-        parsed[name] = parse(prefix)[:TARGET]
+        parsed[name] = (parse_sensex(prefix) if name == SENSEX else parse(prefix))[:TARGET]
         for k, p in enumerate(parsed[name], 1):
             proceeds, notes = p["proceeds"], []
             real = ov.get((p["symbol"], p["entry_time"]))
@@ -476,6 +581,13 @@ def main():
     print("\nSame-day backtest and stop checks (index R, net of backtest cost)")
     cmp_frames = []
     for prefix, (name, pkl) in STRATS.items():
+        if name == SENSEX:
+            # no same-day replay engine for SENSEX yet; R comes from the logged index exits
+            R = np.array([sensex_r(t) for t in parsed[name]], float)
+            print(f"\n{name}: {len(parsed[name])} live trade(s); same-day backtest not built yet")
+            for ln in stop_check(name, R, thresholds(pkl)):
+                print(ln)
+            continue
         if name not in INDEX_META:
             continue
         files = sorted(LOGS.glob(f"{prefix}_*_IST.log"))
