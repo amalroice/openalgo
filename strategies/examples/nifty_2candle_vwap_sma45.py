@@ -139,6 +139,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from openalgo import api
 
+from live_guard import live_blocked
+
 # =============================================================================
 # CONFIGURATION  (per-strategy env vars do not exist in the host - edit here)
 # =============================================================================
@@ -2352,6 +2354,18 @@ def square_off(client, state: dict) -> dict:
 # MAIN
 # =============================================================================
 
+def apply_live_guard() -> None:
+    """Stop rule (user, 2026-11-17): 30 live trades at PF <= 1 turns real orders off.
+
+    Called only just before a new entry, while flat, so an open trade always
+    exits the way it entered.
+    """
+    global DRY_RUN
+    if not DRY_RUN and live_blocked("NIFTY 2-candle", log):
+        DRY_RUN = True
+        log("live guard: DRY_RUN is now on; no real orders from here")
+
+
 def cycle(client, state: dict) -> dict:
     """Run one bar's worth of work.
 
@@ -2430,6 +2444,7 @@ def cycle(client, state: dict) -> dict:
         log(f"{sig['direction']} signal ignored: non-positive risk")
         return state
 
+    apply_live_guard()
     expiry = nearest_weekly(client)
     if not expiry:
         return state

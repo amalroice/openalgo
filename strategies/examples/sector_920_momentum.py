@@ -83,6 +83,8 @@ from zoneinfo import ZoneInfo
 
 from openalgo import api
 
+from live_guard import live_blocked
+
 # =============================================================================
 # CONFIGURATION  (per-strategy env vars do not exist in the host - edit here)
 # =============================================================================
@@ -460,6 +462,8 @@ def live_allowed(client) -> bool:
     in the log whether the orders are real or sandbox-simulated.
     """
     if not TRADE_LIVE:
+        return False
+    if live_blocked("Sector 920", log):     # stop rule: 30 live trades at PF <= 1 (user, 2026-11-17)
         return False
     st = None
     for attempt in range(1, 4):

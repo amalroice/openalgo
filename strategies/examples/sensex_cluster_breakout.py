@@ -141,6 +141,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from openalgo import api
 
+from live_guard import live_blocked
+
 # =============================================================================
 # CONFIGURATION  (per-strategy env vars do not exist in the host - edit here)
 # =============================================================================
@@ -1597,6 +1599,7 @@ def cycle(client, state: dict) -> dict:
             legs[opt_type] = (leg, option_ltp(client, leg["symbol"]) if leg else None)
         leg, premium = legs[opt_type]
         shown = f"{premium:.2f}" if premium is not None else "unknown"
+        apply_live_guard()
         head = "LIVE signal" if TRADE_LIVE else "PAPER"
         gap = gate_quotes.get("gap")
         mult = lot_multiplier(gap)
@@ -1665,6 +1668,18 @@ def summary(state: dict) -> None:
         avg_slip = f", average stop slippage {sum(slips) / len(slips):+.2f} pts" if slips else ""
         log(f"[{name}] day summary: {len(closed)} paper trades, index {gross:+.2f} pts gross, "
             f"{gross - COST_PTS * lots:+.2f} after cost ({lots} lot exits){avg_slip}")
+
+
+def apply_live_guard() -> None:
+    """Stop rule (user, 2026-11-17): 30 live trades at PF <= 1 turns real orders off.
+
+    Called just before a new entry. An open position exits by its own
+    buy_orderid, not by TRADE_LIVE, so it is never stranded by the switch.
+    """
+    global TRADE_LIVE
+    if TRADE_LIVE and live_blocked("Sensex cluster", log):
+        TRADE_LIVE = False
+        log("live guard: TRADE_LIVE is now off; paper from here")
 
 
 def main() -> int:

@@ -1,0 +1,4 @@
+{
+ "2026-11-09|NIFTY17NOV2625000PE": {"price": 294.4, "how": "Runner lot gone from the position book at 13:00; the logged broker stop (trigger 260.05) was never reached (1m low 290.00), so likely a hand exit. Price = average 1m close 12:55-13:00."},
+ "2026-11-11|NIFTY17NOV2625350PE": {"price": 298.8, "how": "Runner lot closed by hand, noticed at 14:50. Price = average 1m close 14:45-14:50 (range in that window 277.90-312.05)."}
+}
