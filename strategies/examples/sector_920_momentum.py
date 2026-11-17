@@ -1,4 +1,4 @@
-"""Sector-heatmap 09:20 momentum, traded with the stock's ATM option. LIVE from 2026-11-09 (book 1.5R).
+"""Sector-heatmap 09:20 momentum, traded with the stock's ATM option. PAPER from 2026-11-17 (was LIVE 2026-11-09..11-17, book 1.5R).
 
 From 2026-11-11 the 09:20 pick is no longer bought at 09:21. It is bought at
 CONFIRM_TIME (10:15) only if, since the 09:20 snapshot, the stock has moved at
@@ -108,7 +108,7 @@ MIN_SECTOR_COVER = 0.5              # a sector needs this share of its stocks qu
 COST_PCT = 0.05                     # stock-version backtest cost, for the % figures
 
 # Option execution (from 2026-11-04)
-TRADE_LIVE = True                   # live from 2026-11-09; False = dry run, no order is ever sent
+TRADE_LIVE = False                  # live 2026-11-09..11-17; paper from 2026-11-17 (user suspended live trading)
 LIVE_BOOK = "1.5R"                  # the one book that trades when TRADE_LIVE is True (1.5R from 2026-11-03)
 LOTS = 1                            # lots per live entry; quantity = LOTS x contract lot size
 PRODUCT = "MIS"                     # intraday; broker end-of-day square-off is the backstop
