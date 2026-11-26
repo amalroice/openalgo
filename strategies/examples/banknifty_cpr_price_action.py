@@ -133,6 +133,15 @@ CPR-band setups to the extra tier, even with the check, lowered PF.
       2023+             332           59%    1.63  +11,982
     2026 to Nov 6        82           63%    2.12   +4,954  (1 losing month)
 
+VIX BAND (2026-11-26, user). No new entry when India VIX at the signal is
+below 12 or above 25; VIX unreadable also skips. Backtest 2016-2026
+(backtesting/vix_ranges/vix_ranges.py):
+
+                     trades  win    PF    rupees (1 lot)
+    no VIX gate        1037  56.4%  1.48  727,636
+    VIX 12-25           874  58.8%  1.62  753,938
+      last 2y           131  67.2%  2.31  (was 173, 63.0%, 1.88)
+
 Note on logging: the strategy host captures stdout to log/strategies/, so
 print() is the logging channel here (host contract).
 """
@@ -190,6 +199,8 @@ NO_ENTRY_WINDOWS = ((dtime(13, 0), dtime(13, 55)),)   # no entries on candles st
 STOP_AFTER_LOSS = True              # no new entry once a trade has hit its stop today
 SKIP_ZONES = frozenset({"S1S2", "aboveR2", "belowS2"})   # no trading on days opening here; empty = trade all
 SQUARE_OFF = dtime(15, 10)
+VIX_MIN = 12.0                      # no new entry below this India VIX (from 2026-11-26, user)
+VIX_MAX = 25.0                      # no new entry above this India VIX (from 2026-11-26, user)
 PRIOR_DAYS = 10                     # calendar days searched for the previous session
 
 BAR_SECONDS = BAR_MINUTES * 60
@@ -558,6 +569,20 @@ def index_ltp(client) -> float | None:
     if not ok(q):
         return None
     return float((q.get("data") or {}).get("ltp") or 0) or None
+
+
+def read_vix(client) -> float | None:
+    """India VIX right now, or None when it cannot be read."""
+    try:
+        q = client.quotes(symbol="INDIAVIX", exchange="NSE_INDEX")
+    except Exception as exc:  # noqa: BLE001
+        log(f"VIX quote raised {exc!r}")
+        return None
+    if not ok(q):
+        log(f"VIX quote failed: {q}")
+        return None
+    d = q.get("data") or {}
+    return float(d.get("ltp") or d.get("prev_close") or 0) or None
 
 
 def option_ltp(client, symbol: str) -> float | None:
@@ -1042,6 +1067,15 @@ def cycle(client, state: dict) -> dict:
     if STOP_AFTER_LOSS and any(t["why"] in ("stop", "broker-stop") for t in state["closed"]):
         log(f"{head} | {sig['setup']} signal skipped: a stop was already hit today")
         return state
+    if VIX_MIN is not None or VIX_MAX is not None:
+        vix = read_vix(client)
+        if vix is None:
+            log(f"{head} | {sig['setup']} signal skipped: VIX unreadable")
+            return state
+        if (VIX_MIN is not None and vix < VIX_MIN) or (VIX_MAX is not None and vix > VIX_MAX):
+            log(f"{head} | {sig['setup']} signal skipped: VIX {vix:.2f} outside {VIX_MIN:g}-{VIX_MAX:g}")
+            return state
+        log(f"{head} | VIX {vix:.2f} inside {VIX_MIN:g}-{VIX_MAX:g}")
     state["taken"].append(key)
     long = sig["long"]
     spot = index_ltp(client) or sig["entry"]
