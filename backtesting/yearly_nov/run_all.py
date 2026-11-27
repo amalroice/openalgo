@@ -61,6 +61,9 @@ FIXUP = {"BAJAJ-AUTO": "BAJAJ_AUTO", "M&M": "M_AMP_M"}
 
 
 def load(path: Path, name: str):
+    # Live scripts import siblings (live_guard.py from 2026-11-17), so their folder must be importable.
+    if str(Path(path).parent) not in sys.path:
+        sys.path.insert(0, str(Path(path).parent))
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
