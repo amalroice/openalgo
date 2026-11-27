@@ -5,6 +5,12 @@ profit factor (rupees won / rupees lost, option premium before charges) is
 MAX_STOP_PF (1.0) or less, the strategy stops sending real orders and runs on
 paper from its next entry on.
 
+Losing-streak rule (user's rule, 2026-11-20): a strategy listed in
+MAX_LOSS_STREAK stops live trading once that many of its most recent closed
+live trades are all losses. BANKNIFTY CPR is set to 4: its longest losing run
+in the last two years of backtest was 3, and it had 2 live losses in a row
+(11-12, 11-20) when the rule was added. The stop is latched like the PF rule.
+
 Each strategy calls live_blocked() just before a new entry, while it is flat,
 so a trade that is already open is always exited the way it was entered.
 
@@ -31,6 +37,9 @@ from zoneinfo import ZoneInfo
 
 REVIEW_AT = 30          # closed live trades before the rule can stop a strategy
 MAX_STOP_PF = 1.0       # profit factor at or below this, after REVIEW_AT trades, stops live trading
+MAX_LOSS_STREAK = {     # tracker name -> live losses in a row that stop live trading
+    "BankNifty CPR": 4,
+}
 
 IST = ZoneInfo("Asia/Kolkata")
 REPO = Path(__file__).resolve().parents[2]
@@ -54,14 +63,22 @@ def live_stats(strategy: str) -> dict:
         strategy: the tracker's name for it, e.g. "NIFTY 2-candle".
 
     Returns:
-        {"trades", "won", "lost", "net", "pf"}; pf is None when nothing was lost.
+        {"trades", "won", "lost", "net", "pf", "streak"}; pf is None when nothing was
+        lost; streak is the live losses in a row at the end of the list.
     """
     rows = [r for r in _parser().collect()
             if r["strategy"] == strategy and r["mode"] == "Live" and r["pnl_rs"] is not None]
+    rows.sort(key=lambda r: (r["date"], r["entry_time"] or ""))
+    streak = 0
+    for r in reversed(rows):
+        if r["pnl_rs"] >= 0:
+            break
+        streak += 1
     won = sum(r["pnl_rs"] for r in rows if r["pnl_rs"] > 0)
     lost = -sum(r["pnl_rs"] for r in rows if r["pnl_rs"] < 0)
     return {"trades": len(rows), "won": round(won, 2), "lost": round(lost, 2),
-            "net": round(won - lost, 2), "pf": round(won / lost, 3) if lost > 0 else None}
+            "net": round(won - lost, 2), "pf": round(won / lost, 3) if lost > 0 else None,
+            "streak": streak}
 
 
 def _read_latch() -> dict:
@@ -88,8 +105,9 @@ def live_blocked(strategy: str, log=print) -> bool:
         latch = _read_latch()
         if strategy in latch:
             s = latch[strategy]
-            log(f"LIVE GUARD: {strategy} was stopped on {s.get('stopped_at')} after {s.get('trades')} live "
-                f"trades at PF {s.get('pf')}; paper only (remove it from {LATCH.name} to trade live again)")
+            why = s.get("reason") or f"{s.get('trades')} live trades at PF {s.get('pf')}"
+            log(f"LIVE GUARD: {strategy} was stopped on {s.get('stopped_at')} ({why}); "
+                f"paper only (remove it from {LATCH.name} to trade live again)")
             return True
         st = live_stats(strategy)
         pf_text = "no losses" if st["pf"] is None else f"{st['pf']:.2f}"
@@ -100,8 +118,19 @@ def live_blocked(strategy: str, log=print) -> bool:
             log(f"LIVE GUARD: {strategy} STOPPED - {st['trades']} live trades, profit factor {pf_text} "
                 f"(needs > {MAX_STOP_PF:g}), net Rs {st['net']:+,.0f}; no more real orders, paper from now")
             return True
+        cap = MAX_LOSS_STREAK.get(strategy)
+        if cap is not None and st["streak"] >= cap:
+            reason = f"{st['streak']} live losses in a row (limit {cap})"
+            latch[strategy] = {"stopped_at": datetime.now(IST).isoformat(timespec="seconds"),
+                               "trades": st["trades"], "pf": st["pf"], "net_rs": st["net"],
+                               "reason": reason}
+            _write_latch(latch)
+            log(f"LIVE GUARD: {strategy} STOPPED - {reason}, net Rs {st['net']:+,.0f}; "
+                f"no more real orders, paper from now")
+            return True
+        streak_text = f", losses in a row {st['streak']}/{cap}" if cap is not None else ""
         log(f"live guard: {strategy} {st['trades']}/{REVIEW_AT} live trades, PF {pf_text}, "
-            f"net Rs {st['net']:+,.0f}; live allowed")
+            f"net Rs {st['net']:+,.0f}{streak_text}; live allowed")
         return False
     except Exception as exc:  # noqa: BLE001 - the rule must fail safe, never skip
         log(f"LIVE GUARD: check failed ({exc!r}); refusing real orders for this entry, paper instead")
